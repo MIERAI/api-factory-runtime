@@ -19,6 +19,7 @@ import (
 	"github.com/MIERAI/api-factory-runtime/clock"
 	"github.com/MIERAI/api-factory-runtime/internal/itest"
 	"github.com/MIERAI/api-factory-runtime/message"
+	"github.com/MIERAI/api-factory-runtime/metrics"
 	"github.com/MIERAI/api-factory-runtime/outbox"
 	"github.com/MIERAI/api-factory-runtime/topology"
 	"github.com/MIERAI/api-factory-runtime/txn"
@@ -174,7 +175,7 @@ func TestRelayPublishes(t *testing.T) {
 			outbox.Message{Kind: message.Event, Type: evt, Version: 1, Subject: "a", Data: map[string]any{"n": 1}},
 			outbox.Message{Kind: message.Command, Type: cmd, Version: 2, Subject: "b", Data: map[string]any{"n": 2}},
 			outbox.Message{Kind: message.Command, Type: lost, Version: 1, Subject: "c"},
-			outbox.Message{Kind: message.Event, Type: "evt.unsubscribed." + sfx, Version: 1, Subject: "d"}, // 没有订阅者的事件: 正常
+			outbox.Message{Kind: message.Event, Type: "evt.unsubscribed." + sfx, Version: 1, Subject: "d"}, // 没有订阅者的事件: 丢弃,但看得见
 		)
 		return err
 	}); err != nil {
@@ -206,6 +207,20 @@ func TestRelayPublishes(t *testing.T) {
 		err := pool.QueryRow(context.Background(), `SELECT attempts, last_error FROM factory_outbox WHERE type = $1`, lost).Scan(&attempts, &lastErr)
 		return err == nil && attempts >= 1 && lastErr != nil && strings.Contains(*lastErr, "unroutable") && pending(t, pool) == 1
 	})
+	// 没有订阅队列的事件: 标成已发送(不堵 outbox),但记下 last_error + 指标(不悄悄丢)
+	var published bool
+	var lastErr *string
+	if err := pool.QueryRow(context.Background(), `SELECT published_at IS NOT NULL, last_error FROM factory_outbox WHERE type = $1`,
+		"evt.unsubscribed."+sfx).Scan(&published, &lastErr); err != nil {
+		t.Fatal(err)
+	}
+	if !published || lastErr == nil || !strings.Contains(*lastErr, "unroutable") {
+		t.Errorf("unroutable event: published %v last_error %v", published, lastErr)
+	}
+	if metrics.UnroutableCount("event", "evt.unsubscribed."+sfx) != 1 || metrics.UnroutableCount("command", lost) < 1 ||
+		metrics.UnroutableCount("event", evt) != 0 {
+		t.Errorf("unroutable metric: event %d command %d", metrics.UnroutableCount("event", "evt.unsubscribed."+sfx), metrics.UnroutableCount("command", lost))
+	}
 }
 
 // 崩溃(真的 os.Exit(137))在发布之后、标记之前 → 重启后同一条消息(同一个 id、逐字节相同)再发一次。
