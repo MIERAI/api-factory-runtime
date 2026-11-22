@@ -21,7 +21,8 @@ factory itself — the generator, the core algebra, the verification — is a se
 | `consume` | The consumer loop of a message handler: dedup by message id in the handler's transaction, ack after commit, tiered retry queues, DLQ, poison messages, graceful shutdown; DLQ admin (`list` / `requeue` / `drop`) |
 | `topology` | Declares the exchanges, queues, retry queues and dead letter queues |
 | `broker` | The process's RabbitMQ connection (reconnects on demand) |
-| `leader` | "One active instance per database" background tasks (Postgres advisory lock): the outbox relay, later the state machines' timeout scanner |
+| `leader` | "One active instance per database" background tasks (Postgres advisory lock): the outbox relay, the state machines' timeout scanner |
+| `sm` | State machines (R5): the timeout scanner (`Scanner`: generated `Due` / `Fire` / `Stats`, one transaction per instance with optimistic-lock retries, one active scanner per database, a round every 5s), its test entry (`POST /factory.test/timeouts`) and the state machine metrics |
 | `cmd/factory-runtime` | Operations CLI: `factory-runtime dlq {list\|requeue\|drop} --queue <queue>` |
 
 ## Messaging (R4, v0.4.0)
@@ -130,6 +131,39 @@ handlers. **No ordering is guaranteed**, not even per subject: handlers must be 
   (decode, dedup, handler, commit) without RabbitMQ and returns the outcome — the in-process layer of the generated
   services' differential tests. Mounted by the generated wiring, answers only with `FACTORY_TEST_FAULTS=1` (404
   otherwise, unit-tested).
+
+## State machines (R5, v0.5.0)
+
+A state machine's transitions are generated code: one message handler per received message type, each a single
+conditional update (`UPDATE … SET state = to, entered = now, attempts = 0, version + 1 WHERE key AND state = from
+[AND guard]`) plus the outbox writes; a message that cannot transition is classified from the state graph (late →
+ignored and acknowledged, guard false / impossible / not found → DLQ). Only the parts every machine shares live here.
+
+### `sm`
+
+- `Scanner{Machine, Exec, Due, Fire, Stats, Every, Batch}`: `Due(ctx, q, now, limit)` (generated SQL: the instances
+  whose timeout or deadline has passed at `now`, oldest first), `Fire(ctx, tx, key, now)` (generated: read the row,
+  decide resend / deadline, `UPDATE … WHERE version = read`, write the outbox; returns `Fired{Kind, From, To}`),
+  `Stats(ctx, q)` (instances and the oldest entry time per waiting state).
+- `Round(ctx, q, now)`: one round, at most `Batch` (100) instances, each in its own transaction (`txn.Executor.InTx`,
+  so test fault injection applies); `Fired{Kind: Conflict}` or a `txn` conflict re-runs that instance's transaction
+  (read and decide again) up to 3 times. One instance's error does not stop the round (`RoundResult.Errors`).
+- `Run(ctx, pool)`: `leader.Run` with the lock `factory.sm.timeout.<machine>`, a round every `Every` (5s) with
+  `time.Now()`. With `FACTORY_TEST_CLOCK=1` it does nothing: tests drive time.
+- `TestHandler(pool, scanners...)` at `TestPath` = `/factory.test/timeouts`:
+  `{"machine": "OrderSaga", "now": "<RFC 3339>", "headers": {"x-factory-fail-after": "2"}}` → the `RoundResult`.
+  Answers only with `FACTORY_TEST_FAULTS=1` (404 otherwise).
+- Metrics (`/metrics`): `factory_sm_transitions_total{machine,from,to,trigger}` (trigger = message type, `timeout`
+  for a resend, `deadline`), `factory_sm_messages_ignored_total{machine,reason}`,
+  `factory_sm_messages_rejected_total{machine,reason}`, `factory_sm_instances{machine,state}`,
+  `factory_sm_oldest_in_state_seconds{machine,state}`, `factory_sm_timeout_backlog{machine}`,
+  `factory_sm_completion_seconds{machine,state}` (creation to a final state). The generated handlers call
+  `sm.Transition` / `sm.Ignored` / `sm.Rejected` / `sm.Completed`.
+
+### `txn` additions (v0.5.0)
+
+- `Mul(a, b)` and `T(x, typ)` (`x::typ`): `total + qty × price` where both factors are parameters (Postgres cannot
+  infer the type of `$1 * $2`; the type name is checked).
 
 ### Test hooks (test environments only)
 

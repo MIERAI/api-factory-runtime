@@ -7,6 +7,7 @@ package txn
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -16,7 +17,8 @@ import (
 // Expr: 表达式的一个节点。
 //   - "col": 这一行(update 的对象)的列 Name 的值(更新之前的值,和 SQL 一样)
 //   - "val": 值 Value(参数;可以是 Later: 执行到这个操作时才取值)
-//   - "+" / "-": Args[0] ± Args[1]
+//   - "+" / "-": Args[0] ± Args[1];"*": Args[0] × Args[1](R5: 数量 × 单价)
+//   - "cast": Args[0]::Name(参数的类型: 两边都是参数的乘法,Postgres 推不出参数的类型)
 //   - "=" / "<>" / "<" / "<=" / ">" / ">=": 比较(任一边为空 → 不确定 → 条件不成立)
 //   - "and": 全部成立
 type Expr struct {
@@ -36,6 +38,12 @@ func V(v any) *Expr { return &Expr{Op: "val", Value: v} }
 func Add(a, b *Expr) *Expr { return &Expr{Op: "+", Args: []*Expr{a, b}} }
 func Sub(a, b *Expr) *Expr { return &Expr{Op: "-", Args: []*Expr{a, b}} }
 
+// Mul: 乘(两边常常都是参数: 用 T 写明参数的类型)。
+func Mul(a, b *Expr) *Expr { return &Expr{Op: "*", Args: []*Expr{a, b}} }
+
+// T: x::typ(typ 是 Postgres 的类型名: int4 / int8 / numeric …)。
+func T(x *Expr, typ string) *Expr { return &Expr{Op: "cast", Name: typ, Args: []*Expr{x}} }
+
 // Cmp: 比较(op = "=" / "<>" / "<" / "<=" / ">" / ">=")。
 func Cmp(op string, a, b *Expr) *Expr { return &Expr{Op: op, Args: []*Expr{a, b}} }
 
@@ -54,6 +62,8 @@ func arg(v any) any {
 	return v
 }
 
+var typeName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
 var cmpOps = map[string]bool{"=": true, "<>": true, "<": true, "<=": true, ">": true, ">=": true}
 
 // sqlExpr: 表达式 → SQL(参数接在 args 后面)。
@@ -70,7 +80,16 @@ func sqlExpr(b *strings.Builder, x *Expr, args *[]any) error {
 	case x.Op == "val":
 		*args = append(*args, arg(x.Value))
 		b.WriteString("$" + strconv.Itoa(len(*args)))
-	case x.Op == "+" || x.Op == "-" || cmpOps[x.Op]:
+	case x.Op == "cast":
+		if len(x.Args) != 1 || !typeName.MatchString(x.Name) {
+			return fmt.Errorf("txn: cast to %q", x.Name)
+		}
+		b.WriteString("(")
+		if err := sqlExpr(b, x.Args[0], args); err != nil {
+			return err
+		}
+		b.WriteString(")::" + x.Name)
+	case x.Op == "+" || x.Op == "-" || x.Op == "*" || cmpOps[x.Op]:
 		if len(x.Args) != 2 {
 			return fmt.Errorf("txn: %s needs 2 operands, got %d", x.Op, len(x.Args))
 		}
