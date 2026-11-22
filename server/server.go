@@ -174,6 +174,7 @@ func run(log *slog.Logger, build Builder) error {
 		anomaly.WriteMetrics(w)
 		metrics.Write(w)
 		metrics.WriteMessaging(w)
+		metrics.WriteMachines(w)
 	}
 	mux.HandleFunc("/metrics", writeMetrics) // 对外的端口: 和 API 一样要认证
 	// METRICS_PORT: 指标的内部端口(不认证,不对外暴露;Prometheus 从这里抓)

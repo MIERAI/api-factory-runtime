@@ -323,6 +323,11 @@ func TestBuildR32(t *testing.T) {
 			[]any{int64(7), "10"}},
 		{"later value", Op{Kind: Insert, Table: "logs", Values: []Col{{Name: "run_id", Value: Later(func() any { return id })}}},
 			`INSERT INTO "logs" ("run_id") VALUES ($1) RETURNING 1`, []any{int64(41)}},
+		{"multiply typed parameters (R5)", Op{Kind: Update, Table: "orders",
+			Values: []Col{{Name: "total", Expr: Add(C("total"), Mul(T(V(int32(2)), "int4"), T(V("1000.50"), "numeric")))}},
+			Key:    []Col{{Name: "id", Value: int64(1)}}},
+			`UPDATE "orders" SET "total" = ("total" + (($1)::int4 * ($2)::numeric)) WHERE "id" = $3 RETURNING 1`,
+			[]any{int32(2), "1000.50", int64(1)}},
 	}
 	for _, c := range cases {
 		sql, args, err := Build(c.op)
@@ -336,6 +341,7 @@ func TestBuildR32(t *testing.T) {
 	}
 	bad := []Op{
 		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Value: 1}}, Key: []Col{{Name: "id", Value: 1}}, Cond: Cmp("=", C("a"), V(1))}, // 没有原因码
+		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Expr: T(V(1), "int4; drop")}}, Key: []Col{{Name: "id", Value: 1}}},           // 类型名不合法
 		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Value: 1}}, Key: []Col{{Name: "id", Value: 1}}, Cond: C("a"), Unmet: "X"},     // 条件不是比较
 		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Expr: Cmp("=", C("a"), V(1))}}, Key: []Col{{Name: "id", Value: 1}}},           // 值是条件
 		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Expr: &Expr{Op: "*"}}}, Key: []Col{{Name: "id", Value: 1}}},                   // 不认识的运算
