@@ -4,6 +4,22 @@ permissions: { contents: read }
 jobs:
   test:
     runs-on: ubuntu-latest
+    # 集成测试(txn / outbox / consume / leader)用的真实 Postgres 和 RabbitMQ
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_PASSWORD: pw }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+      rabbitmq:
+        image: rabbitmq:3.13.7-management
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping" --health-interval 5s --health-timeout 10s --health-retries 30
+    env:
+      RUNTIME_TEST_DB: postgres://postgres:pw@localhost:5432/postgres?sslmode=disable
+      RUNTIME_TEST_AMQP: amqp://guest:guest@localhost:5672/
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

@@ -23,7 +23,9 @@ import (
 
 	"github.com/MIERAI/api-factory-runtime/anomaly"
 	"github.com/MIERAI/api-factory-runtime/apierr"
+	"github.com/MIERAI/api-factory-runtime/broker"
 	"github.com/MIERAI/api-factory-runtime/clock"
+	"github.com/MIERAI/api-factory-runtime/message"
 	"github.com/MIERAI/api-factory-runtime/metrics"
 	"github.com/MIERAI/api-factory-runtime/paging"
 	"github.com/MIERAI/api-factory-runtime/shard"
@@ -41,15 +43,20 @@ type Deps struct {
 	Shards *shard.Router // 分库的连接路由(没有配置时 = 主库)
 	Pool   *pgxpool.Pool
 	Pager  *paging.Pager
+	// AMQP: 到 RabbitMQ 的连接(AMQP_URL;没有设置时 = nil)。outbox 的中继、消费循环用(R4)
+	AMQP *broker.Conn
+	// Workers: 和服务器同生命周期的后台任务(outbox 的中继、消费循环、R5 的超时扫描)。Builder 里登记
+	Workers *Workers
 }
 
 // Builder 由生成的 wiring 代码实现,负责把 handler 挂到服务上。
 type Builder func(deps Deps, opts ...connect.HandlerOption) []Service
 
 type config struct {
-	port           string
-	databaseURL    string
-	requestTimeout time.Duration
+	port            string
+	databaseURL     string
+	requestTimeout  time.Duration
+	shutdownTimeout time.Duration
 }
 
 func loadConfig() (config, error) {
@@ -57,6 +64,8 @@ func loadConfig() (config, error) {
 		port:           envOr("PORT", "8080"),
 		databaseURL:    os.Getenv("DATABASE_URL"),
 		requestTimeout: 3 * time.Second,
+		// 停机时等 HTTP 请求 / 后台任务各自的上限: 要 ≥ 消息处理器的事务超时(consume.Consumer.Timeout,默认 10s)
+		shutdownTimeout: 15 * time.Second,
 	}
 	if c.databaseURL == "" {
 		return c, errors.New("DATABASE_URL is required")
@@ -67,6 +76,13 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("REQUEST_TIMEOUT_MS: %w", err)
 		}
 		c.requestTimeout = time.Duration(ms) * time.Millisecond
+	}
+	if v := os.Getenv("SHUTDOWN_TIMEOUT_MS"); v != "" {
+		ms, err := strconv.Atoi(v)
+		if err != nil {
+			return c, fmt.Errorf("SHUTDOWN_TIMEOUT_MS: %w", err)
+		}
+		c.shutdownTimeout = time.Duration(ms) * time.Millisecond
 	}
 	return c, nil
 }
@@ -134,8 +150,9 @@ func run(log *slog.Logger, build Builder) error {
 		newLoggingInterceptor(log),
 		apierr.NewSanitizeInterceptor(log),
 		newTimeoutInterceptor(cfg.requestTimeout),
-		clock.NewInterceptor(), // 查询里的 now(): 请求开始的时刻(FACTORY_TEST_CLOCK=1 时由请求头 X-Factory-Now 固定)
-		txn.NewInterceptor(),   // 写操作的故障注入: 只在 FACTORY_TEST_FAULTS=1 时认请求头 X-Factory-Fail-After
+		clock.NewInterceptor(),        // 查询里的 now(): 请求开始的时刻(FACTORY_TEST_CLOCK=1 时由请求头 X-Factory-Now 固定)
+		message.NewTraceInterceptor(), // 请求头 traceparent → 写操作发出的消息(R4)
+		txn.NewInterceptor(),          // 写操作的故障注入: 只在 FACTORY_TEST_FAULTS=1 时认请求头 X-Factory-Fail-After
 		validate.NewInterceptor(),
 	)
 
@@ -143,7 +160,11 @@ func run(log *slog.Logger, build Builder) error {
 	if os.Getenv("PAGE_TOKEN_KEY") == "" {
 		log.Warn("PAGE_TOKEN_KEY not set: using a random key (page tokens break across restarts/instances)")
 	}
-	deps := Deps{Pool: pool, Pager: paging.New([]byte(os.Getenv("PAGE_TOKEN_KEY"))), Shards: shards}
+	deps := Deps{Pool: pool, Pager: paging.New([]byte(os.Getenv("PAGE_TOKEN_KEY"))), Shards: shards, Workers: &Workers{}}
+	if u := os.Getenv("AMQP_URL"); u != "" {
+		deps.AMQP = broker.New(u, envOr("SERVICE_NAME", "api-factory-service"))
+		defer deps.AMQP.Close()
+	}
 	for _, s := range build(deps, opts) {
 		mux.Handle(s.Path, s.Handler)
 		log.Info("service mounted", "path", s.Path)
@@ -152,6 +173,7 @@ func run(log *slog.Logger, build Builder) error {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		anomaly.WriteMetrics(w)
 		metrics.Write(w)
+		metrics.WriteMessaging(w)
 	}
 	mux.HandleFunc("/metrics", writeMetrics) // 对外的端口: 和 API 一样要认证
 	// METRICS_PORT: 指标的内部端口(不认证,不对外暴露;Prometheus 从这里抓)
@@ -196,20 +218,30 @@ func run(log *slog.Logger, build Builder) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 1+len(deps.Workers.list))
 	go func() {
 		log.Info("listening", "port", cfg.port)
 		errCh <- srv.ListenAndServe()
 	}()
+	workerCtx, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
+	waitWorkers := deps.Workers.start(workerCtx, log, errCh)
 
 	select {
 	case err := <-errCh:
+		stopping.Store(true)
+		stopWorkers()
+		waitWorkers(cfg.shutdownTimeout)
 		return err
 	case <-ctx.Done():
 		stopping.Store(true)
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		err := srv.Shutdown(shutdownCtx)
+		// 后台任务在 HTTP 之后停: 消费循环做完正在处理的消息(上限 = 消息的事务超时),中继做完这一批
+		stopWorkers()
+		waitWorkers(cfg.shutdownTimeout)
+		return err
 	}
 }
 
