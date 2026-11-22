@@ -1,6 +1,6 @@
 // Package server 是运行时模板的启动部分。所有生成出来的服务共用,AI 不可修改。
 //
-// 提供: 配置读取 / DB 连接池 / 拦截器链(日志→错误清洗→超时→校验) / livez・readyz・healthz / 优雅停机
+// 提供: 配置读取 / DB 连接池 / 拦截器链(日志→错误清洗→超时→请求开始的时刻→校验) / livez・readyz・healthz / 优雅停机
 package server
 
 import (
@@ -23,6 +23,7 @@ import (
 
 	"github.com/MIERAI/api-factory-runtime/anomaly"
 	"github.com/MIERAI/api-factory-runtime/apierr"
+	"github.com/MIERAI/api-factory-runtime/clock"
 	"github.com/MIERAI/api-factory-runtime/metrics"
 	"github.com/MIERAI/api-factory-runtime/paging"
 	"github.com/MIERAI/api-factory-runtime/shard"
@@ -87,6 +88,9 @@ func run(log *slog.Logger, build Builder) error {
 	if err != nil {
 		return err
 	}
+	if os.Getenv(clock.TestClockEnv) == "1" {
+		log.Warn("FACTORY_TEST_CLOCK=1: the request header " + clock.Header + " sets now() (test environments only)")
+	}
 	if authn.mode == "none" {
 		log.Warn("AUTH_MODE=none: the server does not authenticate (the platform must, e.g. Cloud Run IAM)")
 	}
@@ -126,6 +130,7 @@ func run(log *slog.Logger, build Builder) error {
 		newLoggingInterceptor(log),
 		apierr.NewSanitizeInterceptor(log),
 		newTimeoutInterceptor(cfg.requestTimeout),
+		clock.NewInterceptor(), // 查询里的 now(): 请求开始的时刻(FACTORY_TEST_CLOCK=1 时由请求头 X-Factory-Now 固定)
 		validate.NewInterceptor(),
 	)
 
