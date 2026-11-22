@@ -67,7 +67,8 @@ type Op struct {
 	Key []Col
 	// Version: 乐观锁(update / delete): WHERE … AND 版本列 = 请求带的版本号。nil = 不检查版本
 	Version *Col
-	// Returning: RETURNING 的列;Into: 扫描的目标(和 Returning 一一对应,指针)
+	// Returning: RETURNING 的列;Into: 扫描的目标(和 Returning 一一对应,指针)。
+	// update / delete 没有碰到行、但行存在(Conflict / Unmet)时,Into = 同一个事务里读到的现在的行
 	Returning []string
 	Into      []any
 	// NotFound: 行不存在时的消息(给调用方看的)
@@ -80,7 +81,8 @@ type Op struct {
 	Conflict []string
 	Created  *bool
 	// R4(api-factory docs/design/r4-events-messages.md §5)的 每项(对列表逐项执行)、仅当(由前一个幂等新建的
-	// Created 控制)由生成的代码在 InTx 里用 RunIn / Savepoint 组合,Op 的语义不变
+	// Created / 前一个更新是否真的更新了 控制)、条件不成立 = 跳过(Unmet 时 Into 是现在的行)由生成的代码在 InTx 里
+	// 用 RunIn / Savepoint 组合,Op 的语义不变
 }
 
 // Reason: 写操作失败的原因(生成代码按它决定错误码)。
@@ -369,6 +371,8 @@ func conflictKey(op Op) ([]Col, error) {
 // explain: UPDATE / DELETE 没有碰到行的原因。同一个事务里按主键再读一次,按这个顺序判定:
 // 没有这一行 → NotFound;版本不一致 → Conflict;有条件(条件更新)→ Unmet(业务原因码);
 // 都不是(读到之前被别的事务改过)→ Conflict。
+// 行存在时(Conflict / Unmet)Into 是这次读到的行(Returning 的列): 消息处理器的"条件不成立 = 跳过"按现在的行
+// 判断结果(例: 预留已经是 COMMITTED = 重发,是 RELEASED = 异常)。返回错误时 Into 以前没有定义,所以不影响已有的调用方。
 func explain(ctx context.Context, tx pgx.Tx, i int, op Op) error {
 	var b strings.Builder
 	var args []any
@@ -379,11 +383,22 @@ func explain(ctx context.Context, tx pgx.Tx, i int, op Op) error {
 	} else {
 		b.WriteString("true")
 	}
+	for _, c := range op.Returning { // 行还在(版本不一致 / 条件不成立): 把读到的行扫进 Into(R4: 条件不成立 = 跳过 时要看现在的行)
+		b.WriteString(", " + pgx.Identifier{c}.Sanitize())
+	}
 	b.WriteString(" FROM ")
 	b.WriteString(pgx.Identifier{op.Table}.Sanitize())
 	args = append(args, where(&b, op.Key, nil, len(args))...)
 	var sameVersion bool
-	err := tx.QueryRow(ctx, b.String(), args...).Scan(&sameVersion)
+	targets := []any{&sameVersion}
+	if len(op.Into) == len(op.Returning) {
+		targets = append(targets, op.Into...)
+	} else {
+		for range op.Returning {
+			targets = append(targets, new(any))
+		}
+	}
+	err := tx.QueryRow(ctx, b.String(), args...).Scan(targets...)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		msg := op.NotFound

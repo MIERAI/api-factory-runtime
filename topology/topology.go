@@ -14,6 +14,7 @@
 package topology
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
+	"github.com/MIERAI/api-factory-runtime/broker"
 	"github.com/MIERAI/api-factory-runtime/message"
 )
 
@@ -206,4 +208,32 @@ func Delete(ch Deleter, s Spec) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// Ensure: 服务启动时声明 s(生成的 wiring 的后台任务调用)。RabbitMQ 连不上 → 退避(1s → 30s)重试,直到 ctx 结束
+// (返回 nil);连上之后声明的错误(参数和已有的不一致 = PRECONDITION_FAILED 等)→ 返回错误 = 启动失败(不悄悄改)。
+// 消费循环在队列声明好之前订阅失败也会自己重试,所以不用等 Ensure。
+func Ensure(ctx context.Context, conn *broker.Conn, s Spec) error {
+	var backoff time.Duration
+	for {
+		ch, err := conn.Channel(ctx)
+		if err == nil {
+			derr := Declare(ch, s)
+			_ = ch.Close()
+			var ae *amqp.Error
+			if derr == nil || !errors.As(derr, &ae) || ae.Code != amqp.ChannelError {
+				return derr // 成功,或者服务器拒绝了声明(参数不一致等)
+			}
+			err = derr // 声明途中连接断了: 重试
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		backoff = min(max(backoff*2, time.Second), 30*time.Second)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(backoff):
+		}
+	}
 }

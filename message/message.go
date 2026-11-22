@@ -179,7 +179,11 @@ const (
 	// HeaderFailAfter / HeaderNow: 测试用(只在 FACTORY_TEST_FAULTS=1 / FACTORY_TEST_CLOCK=1 时生效),
 	// 和 HTTP 的 X-Factory-Fail-After / X-Factory-Now 同义
 	HeaderFailAfter = "x-factory-fail-after"
-	HeaderNow       = "x-factory-now"
+	// HeaderFailAttempts: 测试用(FACTORY_TEST_FAULTS=1): 前 n 次处理在第一个写操作之后失败(暂时性错误 → 重试队列),
+	// 第 n+1 次正常处理。重试的副本保留 header,所以 x-factory-fail-after 会让每一次都失败(→ 用尽 → DLQ);
+	// 这个 header 用来验证"重试之后成功"的路径
+	HeaderFailAttempts = "x-factory-fail-attempts"
+	HeaderNow          = "x-factory-now"
 )
 
 // HeaderInt: AMQP header 里的整数(各种整数类型、数字字符串都收)。没有 / 不是整数 → ok = false。

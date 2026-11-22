@@ -528,4 +528,15 @@ func TestProcessInProcess(t *testing.T) {
 	if r.Outcome != consume.Retry || txn.ReasonOf(r.Err) != txn.Injected || e.effects("g") != 0 {
 		t.Fatalf("fault header: %+v", r)
 	}
+	// x-factory-fail-attempts: 1 → 第 1 次失败(重试),第 2 次(重试的副本)成功
+	fa := e.envelope("fa")
+	fab, _ := fa.Encode()
+	r = c.Process(ctx, consume.Delivery{Body: fab, Headers: map[string]any{message.HeaderFailAttempts: "1"}})
+	if r.Outcome != consume.Retry || e.effects("fa") != 0 {
+		t.Fatalf("fail-attempts #1: %+v", r)
+	}
+	r = c.Process(ctx, consume.Delivery{Body: fab, Headers: map[string]any{message.HeaderFailAttempts: "1", message.HeaderAttempt: int32(2)}})
+	if r.Outcome != consume.OK || e.effects("fa") != 1 {
+		t.Fatalf("fail-attempts #2: %+v", r)
+	}
 }
