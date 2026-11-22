@@ -296,3 +296,144 @@ func TestInTxOnDB(t *testing.T) {
 		t.Fatalf("retry after a serialization failure in a savepoint: err=%v calls=%d v=%d", err, calls, v)
 	}
 }
+
+// R3-2: 条件更新 / 幂等新建 / 后面的操作引用前面的返回值。
+func TestBuildR32(t *testing.T) {
+	var id int64 = 41
+	cases := []struct {
+		name string
+		op   Op
+		sql  string
+		args []any
+	}{
+		{"conditional update", Op{Kind: Update, Table: "stock",
+			Values: []Col{{Name: "available", Expr: Add(C("available"), V(int32(-3)))}, Incr1("version")},
+			Key:    []Col{{Name: "sku", Value: "A-1"}},
+			Cond:   Cmp(">=", Add(C("available"), V(int32(-3))), V(int32(0))), Unmet: "INSUFFICIENT_STOCK"},
+			`UPDATE "stock" SET "available" = ("available" + $1), "version" = "version" + 1 WHERE "sku" = $2 AND (("available" + $3) >= $4) RETURNING 1`,
+			[]any{int32(-3), "A-1", int32(-3), int32(0)}},
+		{"condition with version and and", Op{Kind: Update, Table: "t", Values: []Col{{Name: "s", Value: int32(1)}},
+			Key: []Col{{Name: "id", Value: int64(1)}}, Version: &Col{Name: "version", Value: int32(2)},
+			Cond: And(Cmp("=", C("s"), V(int32(2))), Cmp("<>", C("x"), Sub(C("y"), V(1)))), Unmet: "X"},
+			`UPDATE "t" SET "s" = $1 WHERE "id" = $2 AND "version" = $3 AND (("s" = $4) AND ("x" <> ("y" - $5))) RETURNING 1`,
+			[]any{int32(1), int64(1), int32(2), int32(2), 1}},
+		{"idempotent insert", Op{Kind: Insert, Table: "payments", Values: []Col{{Name: "order_id", Value: int64(7)}, {Name: "amount", Value: "10"}},
+			Conflict: []string{"order_id"}, Returning: []string{"amount"}},
+			`INSERT INTO "payments" ("order_id", "amount") VALUES ($1, $2) ON CONFLICT ("order_id") DO NOTHING RETURNING "amount"`,
+			[]any{int64(7), "10"}},
+		{"later value", Op{Kind: Insert, Table: "logs", Values: []Col{{Name: "run_id", Value: Later(func() any { return id })}}},
+			`INSERT INTO "logs" ("run_id") VALUES ($1) RETURNING 1`, []any{int64(41)}},
+	}
+	for _, c := range cases {
+		sql, args, err := Build(c.op)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if sql != c.sql || !reflect.DeepEqual(args, c.args) {
+			t.Errorf("%s:\n got %s %v\nwant %s %v", c.name, sql, args, c.sql, c.args)
+		}
+	}
+	bad := []Op{
+		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Value: 1}}, Key: []Col{{Name: "id", Value: 1}}, Cond: Cmp("=", C("a"), V(1))}, // 没有原因码
+		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Value: 1}}, Key: []Col{{Name: "id", Value: 1}}, Cond: C("a"), Unmet: "X"},     // 条件不是比较
+		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Expr: Cmp("=", C("a"), V(1))}}, Key: []Col{{Name: "id", Value: 1}}},           // 值是条件
+		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Expr: &Expr{Op: "*"}}}, Key: []Col{{Name: "id", Value: 1}}},                   // 不认识的运算
+		{Kind: Insert, Table: "t", Values: []Col{{Name: "a", Value: 1}}, Conflict: []string{"b"}},                                          // 冲突的列没有值
+		{Kind: Insert, Table: "t", Values: []Col{{Name: "a", Expr: C("a")}}},                                                               // insert 带表达式
+		{Kind: Insert, Table: "t", Values: []Col{{Name: "a", Value: 1}}, Cond: Cmp("=", C("a"), V(1)), Unmet: "X"},                         // insert 带条件
+		{Kind: Delete, Table: "t", Key: []Col{{Name: "id", Value: 1}}, Cond: Cmp("=", C("a"), V(1)), Unmet: "X"},                           // delete 带条件
+		{Kind: Update, Table: "t", Values: []Col{{Name: "a", Value: 1}}, Key: []Col{{Name: "id", Value: 1}}, Conflict: []string{"a"}},      // update 带冲突
+	}
+	for i, op := range bad {
+		if _, _, err := Build(op); err == nil {
+			t.Errorf("bad op #%d: want an error", i)
+		}
+	}
+}
+
+// 数据库上: 条件更新的原因判定(不存在 → 版本 → 条件)、幂等新建、组合命令里的 Later。
+func TestExecutorR32OnDB(t *testing.T) {
+	url := os.Getenv("TXN_TEST_DB")
+	if url == "" {
+		t.Skip("TXN_TEST_DB not set")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	mustExec := func(sql string) {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustExec(`DROP TABLE IF EXISTS txn_log, txn_stock, txn_pay`)
+	mustExec(`CREATE TABLE txn_stock (k text PRIMARY KEY, n int NOT NULL CHECK (n >= 0), version int NOT NULL DEFAULT 1)`)
+	mustExec(`CREATE TABLE txn_log (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, k text NOT NULL REFERENCES txn_stock(k), delta int NOT NULL)`)
+	mustExec(`CREATE TABLE txn_pay (order_id bigint PRIMARY KEY, amount numeric NOT NULL, ref text UNIQUE)`)
+	defer mustExec(`DROP TABLE txn_log, txn_stock, txn_pay`)
+	mustExec(`INSERT INTO txn_stock (k, n) VALUES ('a', 5)`)
+	e := New(conn)
+	var n, ver int32
+	var logID int64
+	var logK string
+	adjust := func(k string, delta int32, version *int32) []Op {
+		upd := Op{Kind: Update, Table: "txn_stock",
+			Values: []Col{{Name: "n", Expr: Add(C("n"), V(delta))}, Incr1("version")}, Key: []Col{{Name: "k", Value: k}},
+			Cond: Cmp(">=", Add(C("n"), V(delta)), V(int32(0))), Unmet: "INSUFFICIENT", Returning: []string{"k", "n", "version"},
+			Into: []any{&logK, &n, &ver}, NotFound: "no " + k}
+		if version != nil {
+			upd.Version = &Col{Name: "version", Value: *version}
+		}
+		ins := Op{Kind: Insert, Table: "txn_log", Values: []Col{{Name: "k", Value: Later(func() any { return logK })}, {Name: "delta", Value: delta}},
+			Returning: []string{"id"}, Into: []any{&logID}}
+		return []Op{upd, ins}
+	}
+	if err := e.Run(ctx, adjust("a", -3, nil)...); err != nil || n != 2 || ver != 2 || logID == 0 {
+		t.Fatalf("adjust: %v n=%d ver=%d log=%d", err, n, ver, logID)
+	}
+	err = e.Run(ctx, adjust("a", -3, nil)...)
+	var te *Error
+	if !errors.As(err, &te) || te.Reason != Unmet || te.Code != "INSUFFICIENT" || te.Op != 0 {
+		t.Errorf("unmet: %v", err)
+	}
+	stale := int32(1)
+	if got := ReasonOf(e.Run(ctx, adjust("a", -3, &stale)...)); got != Conflict { // 版本不一致 先于 条件
+		t.Errorf("stale version + unmet condition: %s", got)
+	}
+	cur := int32(2)
+	if got := ReasonOf(e.Run(ctx, adjust("a", -3, &cur)...)); got != Unmet {
+		t.Errorf("right version + unmet condition: %s", got)
+	}
+	if got := ReasonOf(e.Run(ctx, adjust("zz", 1, nil)...)); got != NotFound {
+		t.Errorf("missing: %s", got)
+	}
+	// 故障注入: 第 1 个之后 / 第 2 个之后 → 都回滚
+	for k := 1; k <= 2; k++ {
+		if got := ReasonOf(e.Run(WithFault(ctx, k), adjust("a", 1, nil)...)); got != Injected {
+			t.Errorf("fault %d: %s", k, got)
+		}
+	}
+	var cnt int
+	if err := conn.QueryRow(ctx, `SELECT n * 100 + (SELECT count(*) FROM txn_log) FROM txn_stock WHERE k = 'a'`).Scan(&cnt); err != nil || cnt != 201 {
+		t.Errorf("state after failures: %d %v (want n=2, 1 log row)", cnt, err)
+	}
+	// 幂等新建
+	var amount string
+	var created bool
+	pay := func(order int64, amt, ref string) Op {
+		return Op{Kind: Insert, Table: "txn_pay", Values: []Col{{Name: "order_id", Value: order}, {Name: "amount", Value: amt}, {Name: "ref", Value: ref}},
+			Conflict: []string{"order_id"}, Returning: []string{"amount"}, Into: []any{&amount}, Created: &created}
+	}
+	if err := e.Run(ctx, pay(1, "10", "r1")); err != nil || !created || amount != "10" {
+		t.Fatalf("first charge: %v %v %s", err, created, amount)
+	}
+	if err := e.Run(ctx, pay(1, "99", "r9")); err != nil || created || amount != "10" {
+		t.Errorf("repeated charge: %v created=%v amount=%s (want the first)", err, created, amount)
+	}
+	if got := ReasonOf(e.Run(ctx, pay(2, "5", "r1"))); got != Unique { // 别的唯一约束: 不是幂等键 → 已存在
+		t.Errorf("other unique constraint: %s", got)
+	}
+}

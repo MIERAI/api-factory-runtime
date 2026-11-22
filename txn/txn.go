@@ -3,7 +3,8 @@
 //
 // 分工(api-factory 的命令工厂,R3):
 //   - 这里: 事务(开始 / 提交 / 回滚)、SQL 的组装(标识符加引号,值一律是参数)、"没有更新"的原因判定
-//     (同一个事务里再读一次)、数据库错误的分类、序列化失败 / 死锁的有限重试、测试用的故障注入钩子
+//     (同一个事务里再读一次: 不存在 / 版本冲突 / 条件不成立)、数据库错误的分类、序列化失败 / 死锁的有限重试、
+//     测试用的故障注入钩子;条件更新(Cond)、幂等新建(Conflict)、组合命令里引用前面操作的返回值(Later)
 //   - 生成的代码: 原因 → 错误码(每个服务的 commands_gen.go;改错误码的决定只改生成器,不用发运行时)
 //
 // handler 里不写 SQL,也不碰连接: 生成代码只依赖这个包的 Op / Run / ReasonOf。
@@ -44,10 +45,13 @@ func (k Kind) String() string {
 }
 
 // Col: 列 = 值。Incr 不为 0 时是 "列 = 列 + Incr"(乐观锁的版本号加 1),Value 不用。
+// Expr 不为 nil 时是 "列 = 表达式"(update 的 SET,例: available = available + $1;表达式里的列是更新之前的值),Value 不用。
+// Value 可以是 Later(组合命令: 执行到这个操作时才取前面操作的返回值)。
 type Col struct {
 	Name  string
 	Value any
 	Incr  int64
+	Expr  *Expr
 }
 
 // Incr1: 版本列加 1(update 的 SET 里写;生成代码里看得见,改错了变异测试能抓到)。
@@ -68,8 +72,15 @@ type Op struct {
 	Into      []any
 	// NotFound: 行不存在时的消息(给调用方看的)
 	NotFound string
-	// R3-2 的扩展点: Cond(条件更新: WHERE 里另外的谓词 + 不满足时的业务原因码)、
-	// Idempotent(幂等新建: ON CONFLICT (键) DO NOTHING + 读出已有的行)加在这里,原因判定在 explain 里加一种
+	// Cond: 条件更新(update): WHERE … AND 条件。行存在、版本一致、条件不成立 → Unmet,Error.Code = Unmet(业务原因码)
+	Cond  *Expr
+	Unmet string
+	// Conflict: 幂等新建(insert): INSERT … ON CONFLICT (这些列) DO NOTHING;冲突时读出已有的行(按这些列,
+	// 值 = Values 里同名的列)扫进 Into,不报错、不写。Created: 是否真的插入了(nil = 不需要)
+	Conflict []string
+	Created  *bool
+	// R4(api-factory docs/design/r4-events-messages.md §5)的 每项(对列表逐项执行)、仅当(由前一个幂等新建的
+	// Created 控制)由生成的代码在 InTx 里用 RunIn / Savepoint 组合,Op 的语义不变
 }
 
 // Reason: 写操作失败的原因(生成代码按它决定错误码)。
@@ -85,10 +96,11 @@ const (
 	ForeignKey        // 外键(23503)
 	Retry             // 序列化失败 / 死锁(40001 / 40P01),重试 MaxAttempts 次之后仍然失败
 	Injected          // 测试用的故障注入(FACTORY_TEST_FAULTS=1 + 请求头 X-Factory-Fail-After)
+	Unmet             // update: 行存在、版本一致,条件不成立(条件更新;Error.Code = 业务原因码)
 )
 
 func (r Reason) String() string {
-	return [...]string{"none", "not_found", "conflict", "unique", "check", "not_null", "foreign_key", "retry", "injected"}[r]
+	return [...]string{"none", "not_found", "conflict", "unique", "check", "not_null", "foreign_key", "retry", "injected", "unmet"}[r]
 }
 
 // Error: 写操作失败。Op = 第几个操作(从 0 开始),Constraint = 数据库报的约束名(有的话)。
@@ -97,6 +109,7 @@ type Error struct {
 	Op         int
 	Table      string
 	Constraint string
+	Code       string // Unmet: 设计稿里声明的业务原因码(例: INSUFFICIENT_STOCK)
 	Msg        string // 给调用方看的消息(不含 SQL 和值)
 	Err        error  // 原始的数据库错误(日志用)
 }
@@ -285,25 +298,92 @@ func exec(ctx context.Context, tx pgx.Tx, i int, op Op) error {
 	}
 	switch {
 	case n == 1:
+		if op.Created != nil {
+			*op.Created = true
+		}
 		return nil
 	case n > 1: // 主键 = 一行;多于一行说明 Key 不是主键(生成器的 bug)
 		return fmt.Errorf("txn: op %d (%s %s) touched %d rows, want 1 (key is not the primary key?)", i, op.Kind, op.Table, n)
-	case op.Kind == Insert: // INSERT 没有返回行: 不会发生(R3-2 的幂等新建在这里分支)
+	case op.Kind == Insert && len(op.Conflict) > 0: // 幂等新建: 键已经有了 → 读出已有的行
+		return existing(ctx, tx, i, op)
+	case op.Kind == Insert: // INSERT 没有返回行: 不会发生
 		return fmt.Errorf("txn: op %d (insert %s) returned no row", i, op.Table)
 	}
 	return explain(ctx, tx, i, op)
 }
 
-// explain: UPDATE / DELETE 没有碰到行的原因。同一个事务里按主键再读一次:
-// 没有这一行 → NotFound;有(版本不一致,或者读到之前被别的事务改过)→ Conflict。
-// R3-2 的条件更新: 行存在且版本一致 → 条件不满足(业务原因码)。
+// existing: 幂等新建的冲突 → 同一个事务里按幂等键读出已有的行(READ COMMITTED: 这条语句看得到
+// 刚刚提交的、和我们冲突的那一行)。Created = false。
+func existing(ctx context.Context, tx pgx.Tx, i int, op Op) error {
+	key, err := conflictKey(op)
+	if err != nil {
+		return err
+	}
+	names := []string{"1"}
+	if len(op.Returning) > 0 {
+		names = make([]string, len(op.Returning))
+		for j, c := range op.Returning {
+			names[j] = pgx.Identifier{c}.Sanitize()
+		}
+	}
+	var b strings.Builder
+	b.WriteString("SELECT " + strings.Join(names, ", ") + " FROM " + pgx.Identifier{op.Table}.Sanitize())
+	args := where(&b, key, nil, 0)
+	row := tx.QueryRow(ctx, b.String(), args...)
+	var one int
+	targets := op.Into
+	if len(targets) == 0 {
+		targets = []any{&one}
+	}
+	if err := row.Scan(targets...); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) { // 冲突的行在我们读之前又被删掉了: 当作并发冲突,整个事务重来
+			return &Error{Reason: Conflict, Op: i, Table: op.Table, Msg: op.Table + ": the conflicting row disappeared (retry the request)"}
+		}
+		return classify(i, op, err)
+	}
+	if op.Created != nil {
+		*op.Created = false
+	}
+	return nil
+}
+
+// conflictKey: 幂等键的列 = Values 里同名的列的值。
+func conflictKey(op Op) ([]Col, error) {
+	var key []Col
+	for _, k := range op.Conflict {
+		found := false
+		for _, c := range op.Values {
+			if c.Name == k && c.Incr == 0 && c.Expr == nil {
+				key = append(key, Col{Name: k, Value: c.Value})
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("txn: insert %s: conflict column %s has no value", op.Table, k)
+		}
+	}
+	return key, nil
+}
+
+// explain: UPDATE / DELETE 没有碰到行的原因。同一个事务里按主键再读一次,按这个顺序判定:
+// 没有这一行 → NotFound;版本不一致 → Conflict;有条件(条件更新)→ Unmet(业务原因码);
+// 都不是(读到之前被别的事务改过)→ Conflict。
 func explain(ctx context.Context, tx pgx.Tx, i int, op Op) error {
 	var b strings.Builder
-	b.WriteString("SELECT 1 FROM ")
+	var args []any
+	b.WriteString("SELECT ")
+	if op.Version != nil { // 版本一致吗(空 = 不一致)
+		args = append(args, arg(op.Version.Value))
+		fmt.Fprintf(&b, "coalesce(%s = $1, false)", pgx.Identifier{op.Version.Name}.Sanitize())
+	} else {
+		b.WriteString("true")
+	}
+	b.WriteString(" FROM ")
 	b.WriteString(pgx.Identifier{op.Table}.Sanitize())
-	args := where(&b, op.Key, nil, 0)
-	var one int
-	err := tx.QueryRow(ctx, b.String(), args...).Scan(&one)
+	args = append(args, where(&b, op.Key, nil, len(args))...)
+	var sameVersion bool
+	err := tx.QueryRow(ctx, b.String(), args...).Scan(&sameVersion)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		msg := op.NotFound
@@ -313,6 +393,9 @@ func explain(ctx context.Context, tx pgx.Tx, i int, op Op) error {
 		return &Error{Reason: NotFound, Op: i, Table: op.Table, Msg: msg}
 	case err != nil:
 		return classify(i, op, err)
+	case sameVersion && op.Cond != nil:
+		return &Error{Reason: Unmet, Op: i, Table: op.Table, Code: op.Unmet,
+			Msg: op.Unmet + ": " + op.Table + ": the condition of the update does not hold"}
 	}
 	return &Error{Reason: Conflict, Op: i, Table: op.Table,
 		Msg: op.Table + ": version conflict (the row was changed by someone else; read it again and retry)"}
@@ -328,8 +411,8 @@ func Build(op Op) (string, []any, error) {
 	table := pgx.Identifier{op.Table}.Sanitize()
 	switch op.Kind {
 	case Insert:
-		if len(op.Key) > 0 || op.Version != nil {
-			return "", nil, fmt.Errorf("txn: insert %s: Key / Version are for update and delete", op.Table)
+		if len(op.Key) > 0 || op.Version != nil || op.Cond != nil {
+			return "", nil, fmt.Errorf("txn: insert %s: Key / Version / Cond are for update and delete", op.Table)
 		}
 		b.WriteString("INSERT INTO " + table)
 		if len(op.Values) == 0 {
@@ -338,14 +421,24 @@ func Build(op Op) (string, []any, error) {
 		}
 		names, holders := make([]string, len(op.Values)), make([]string, len(op.Values))
 		for i, c := range op.Values {
-			if c.Incr != 0 {
-				return "", nil, fmt.Errorf("txn: insert %s: column %s: Incr is for update", op.Table, c.Name)
+			if c.Incr != 0 || c.Expr != nil {
+				return "", nil, fmt.Errorf("txn: insert %s: column %s: Incr / Expr are for update", op.Table, c.Name)
 			}
 			names[i] = pgx.Identifier{c.Name}.Sanitize()
-			args = append(args, c.Value)
+			args = append(args, arg(c.Value))
 			holders[i] = "$" + strconv.Itoa(len(args))
 		}
 		b.WriteString(" (" + strings.Join(names, ", ") + ") VALUES (" + strings.Join(holders, ", ") + ")")
+		if len(op.Conflict) > 0 { // 幂等新建: 冲突(只认这个键)→ 不插入、不报错;exec 读出已有的行
+			if _, err := conflictKey(op); err != nil {
+				return "", nil, err
+			}
+			cols := make([]string, len(op.Conflict))
+			for i, c := range op.Conflict {
+				cols[i] = pgx.Identifier{c}.Sanitize()
+			}
+			b.WriteString(" ON CONFLICT (" + strings.Join(cols, ", ") + ") DO NOTHING")
+		}
 	case Update:
 		if len(op.Key) == 0 {
 			return "", nil, fmt.Errorf("txn: update %s without a key", op.Table)
@@ -353,23 +446,50 @@ func Build(op Op) (string, []any, error) {
 		if len(op.Values) == 0 {
 			return "", nil, fmt.Errorf("txn: update %s without columns to set", op.Table)
 		}
+		if len(op.Conflict) > 0 {
+			return "", nil, fmt.Errorf("txn: update %s: Conflict is for insert", op.Table)
+		}
 		b.WriteString("UPDATE " + table + " SET ")
 		for i, c := range op.Values {
 			if i > 0 {
 				b.WriteString(", ")
 			}
 			name := pgx.Identifier{c.Name}.Sanitize()
-			if c.Incr != 0 {
+			switch {
+			case c.Incr != 0:
 				fmt.Fprintf(&b, "%s = %s + %d", name, name, c.Incr)
-				continue
+			case c.Expr != nil:
+				if isCond(c.Expr) {
+					return "", nil, fmt.Errorf("txn: update %s: column %s: a condition is not a value", op.Table, c.Name)
+				}
+				b.WriteString(name + " = ")
+				if err := sqlExpr(&b, c.Expr, &args); err != nil {
+					return "", nil, err
+				}
+			default:
+				args = append(args, arg(c.Value))
+				fmt.Fprintf(&b, "%s = $%d", name, len(args))
 			}
-			args = append(args, c.Value)
-			fmt.Fprintf(&b, "%s = $%d", name, len(args))
 		}
 		args = append(args, where(&b, op.Key, op.Version, len(args))...)
+		if op.Cond != nil { // 条件更新: WHERE 主键 [AND 版本] AND (条件)
+			if !isCond(op.Cond) {
+				return "", nil, fmt.Errorf("txn: update %s: Cond must be a comparison or and", op.Table)
+			}
+			if op.Unmet == "" {
+				return "", nil, fmt.Errorf("txn: update %s: Cond without an Unmet reason code", op.Table)
+			}
+			b.WriteString(" AND ")
+			if err := sqlExpr(&b, op.Cond, &args); err != nil {
+				return "", nil, err
+			}
+		}
 	case Delete:
 		if len(op.Key) == 0 {
 			return "", nil, fmt.Errorf("txn: delete %s without a key", op.Table)
+		}
+		if op.Cond != nil || len(op.Conflict) > 0 {
+			return "", nil, fmt.Errorf("txn: delete %s: Cond / Conflict are not supported", op.Table)
 		}
 		b.WriteString("DELETE FROM " + table)
 		args = append(args, where(&b, op.Key, op.Version, 0)...)
@@ -401,7 +521,7 @@ func where(b *strings.Builder, key []Col, version *Col, offset int) []any {
 		} else {
 			b.WriteString(" AND ")
 		}
-		args = append(args, c.Value)
+		args = append(args, arg(c.Value))
 		fmt.Fprintf(b, "%s = $%d", pgx.Identifier{c.Name}.Sanitize(), offset+len(args))
 	}
 	return args
