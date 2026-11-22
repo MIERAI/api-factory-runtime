@@ -14,3 +14,12 @@ func TestReportAndMetrics(t *testing.T) {
 		t.Fatalf("unexpected metrics:\n%s", b.String())
 	}
 }
+
+func TestReportWrite(t *testing.T) {
+	ReportWrite("products", "products_price_check")
+	var b strings.Builder
+	WriteMetrics(&b)
+	if !strings.Contains(b.String(), `write_rejected_total{table="products",constraint="products_price_check"} 1`) {
+		t.Fatalf("unexpected metrics:\n%s", b.String())
+	}
+}

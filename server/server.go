@@ -27,6 +27,7 @@ import (
 	"github.com/MIERAI/api-factory-runtime/metrics"
 	"github.com/MIERAI/api-factory-runtime/paging"
 	"github.com/MIERAI/api-factory-runtime/shard"
+	"github.com/MIERAI/api-factory-runtime/txn"
 )
 
 // Service 是一个已挂载的 Connect 服务。
@@ -91,6 +92,9 @@ func run(log *slog.Logger, build Builder) error {
 	if os.Getenv(clock.TestClockEnv) == "1" {
 		log.Warn("FACTORY_TEST_CLOCK=1: the request header " + clock.Header + " sets now() (test environments only)")
 	}
+	if txn.TestFaultsEnabled() {
+		log.Warn(txn.TestFaultsEnv + "=1: the request header " + txn.FaultHeader + " makes writes fail (test environments only)")
+	}
 	if authn.mode == "none" {
 		log.Warn("AUTH_MODE=none: the server does not authenticate (the platform must, e.g. Cloud Run IAM)")
 	}
@@ -131,6 +135,7 @@ func run(log *slog.Logger, build Builder) error {
 		apierr.NewSanitizeInterceptor(log),
 		newTimeoutInterceptor(cfg.requestTimeout),
 		clock.NewInterceptor(), // 查询里的 now(): 请求开始的时刻(FACTORY_TEST_CLOCK=1 时由请求头 X-Factory-Now 固定)
+		txn.NewInterceptor(),   // 写操作的故障注入: 只在 FACTORY_TEST_FAULTS=1 时认请求头 X-Factory-Fail-After
 		validate.NewInterceptor(),
 	)
 
