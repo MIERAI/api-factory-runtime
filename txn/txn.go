@@ -141,10 +141,19 @@ func New(db Beginner) *Executor { return &Executor{db: db, iso: pgx.ReadCommitte
 // Run: 在一个事务里按顺序执行 ops。任何一个失败 → 回滚,返回 *Error(或者连接等平台的错误)。
 // 序列化失败 / 死锁 → 整个事务重来(最多 MaxAttempts 次);Into 每次都会被重新写入。
 func (e *Executor) Run(ctx context.Context, ops ...Op) error {
-	failAfter := faultFrom(ctx)
+	return e.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error { return RunIn(ctx, tx, ops...) })
+}
+
+// InTx: 在一个事务里执行 fn,fn 返回 nil 就提交。给"不只是一串 Op"的写入用(R4: 消息处理器的去重 + 操作 + outbox,
+// 写操作之后按返回值组装消息再写 outbox)。fn 里的写操作用 RunIn / Savepoint / outbox.Write,都在 tx 上。
+//
+//   - fn 返回错误 → 回滚,原样返回这个错误
+//   - 序列化失败 / 死锁(fn 里或提交时)→ 整个事务重来,fn 会被再调用(最多 MaxAttempts 次),所以 fn 除了 tx 以外不能有副作用
+//   - 测试的故障注入(WithFault: 第 k 个写操作之后失败)按整个事务计数: RunIn 的每个操作和 AfterWrite 各算一个
+func (e *Executor) InTx(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
 	var err error
 	for attempt := 1; attempt <= MaxAttempts; attempt++ {
-		err = e.once(ctx, ops, failAfter)
+		err = e.once(ctx, fn)
 		if !retryable(err) {
 			return err
 		}
@@ -154,7 +163,7 @@ func (e *Executor) Run(ctx context.Context, ops ...Op) error {
 	return &Error{Reason: Retry, Op: -1, Msg: "concurrent update: retry the request", Err: err, Constraint: constraintOf(pe)}
 }
 
-func (e *Executor) once(ctx context.Context, ops []Op, failAfter int) (err error) {
+func (e *Executor) once(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) (err error) {
 	tx, err := e.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: e.iso})
 	if err != nil {
 		return err
@@ -164,18 +173,87 @@ func (e *Executor) once(ctx context.Context, ops []Op, failAfter int) (err error
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	for i, op := range ops {
-		if err := exec(ctx, tx, i, op); err != nil {
-			return err
-		}
-		if failAfter > 0 && i+1 == failAfter { // 测试用: 第 k 个写操作之后强制失败(之前的写入必须被回滚)
-			return &Error{Reason: Injected, Op: i, Table: op.Table, Msg: fmt.Sprintf("injected fault after write %d", failAfter)}
-		}
+	st := &attemptState{} // 每次尝试从头开始: 故障注入的计数、保存点里遇到的序列化失败
+	ctx = context.WithValue(ctx, stateKey{}, st)
+	ferr := fn(ctx, tx)
+	if st.retry != nil { // 保存点里遇到了序列化失败 / 死锁: 不管 fn 怎么处理了那个错误,整个事务重来
+		return st.retry
+	}
+	if ferr != nil {
+		return ferr
 	}
 	if err := tx.Commit(ctx); err != nil { // 提交时的错误(序列化失败 → 重试;延迟检查的约束 → 原因)
 		return classify(-1, Op{Table: "(commit)"}, err)
 	}
 	return nil
+}
+
+// RunIn: 在已经开始的事务 tx 里按顺序执行 ops(InTx 的 fn 里用)。失败时不回滚 tx: 交给 InTx(返回错误 = 整个回滚)
+// 或者 Savepoint(只回滚到保存点)。错误和 Run 一样(*Error 的 Op 是 ops 里的下标)。
+func RunIn(ctx context.Context, tx pgx.Tx, ops ...Op) error {
+	for i, op := range ops {
+		if err := exec(ctx, tx, i, op); err != nil {
+			return err
+		}
+		if err := afterWrite(ctx, i, op.Table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AfterWrite: 不经过 RunIn 的写入(例: outbox.Write 的每一行)也计入故障注入的写操作个数。
+// 测试设置了"第 k 个写操作之后失败"且这是第 k 个时返回 Reason = Injected 的错误;否则 nil。生产环境总是 nil。
+func AfterWrite(ctx context.Context, table string) error { return afterWrite(ctx, -1, table) }
+
+func afterWrite(ctx context.Context, i int, table string) error {
+	failAfter := faultFrom(ctx)
+	if failAfter <= 0 {
+		return nil
+	}
+	var n *int
+	if st, _ := ctx.Value(stateKey{}).(*attemptState); st != nil {
+		n = &st.writes
+	}
+	if n == nil { // 不在 InTx 里(直接对一个 tx 调用 RunIn): 按这一次调用的下标数
+		n = new(int)
+		*n = i
+		if i < 0 {
+			return nil
+		}
+	}
+	*n++
+	if *n == failAfter { // 测试用: 第 k 个写操作之后强制失败(之前的写入必须被回滚)
+		return &Error{Reason: Injected, Op: i, Table: table, Msg: fmt.Sprintf("injected fault after write %d", failAfter)}
+	}
+	return nil
+}
+
+type stateKey struct{}
+
+type attemptState struct {
+	writes int   // 这次尝试里做过的写操作(故障注入)
+	retry  error // 保存点里遇到的序列化失败 / 死锁
+}
+
+// Savepoint: 在 tx 里开一个保存点执行 fn。fn 返回错误 → 只回滚到保存点(之前的写入和 tx 都还在),返回 fn 的错误;
+// 否则释放保存点。R4 §4.2: 业务结果(条件不满足)要回滚已经做了的操作,但去重记录和结果消息照样提交。
+// 序列化失败 / 死锁不是业务结果: 在 InTx 里时记下来,InTx 不管 fn 怎么处理了这个错误都会让整个事务重来。
+func Savepoint(ctx context.Context, tx pgx.Tx, fn func(ctx context.Context, tx pgx.Tx) error) error {
+	sp, err := tx.Begin(ctx) // pgx: 事务里的 Begin = SAVEPOINT
+	if err != nil {
+		return err
+	}
+	if err := fn(ctx, sp); err != nil {
+		if st, _ := ctx.Value(stateKey{}).(*attemptState); st != nil && retryable(err) && st.retry == nil {
+			st.retry = err
+		}
+		if rerr := sp.Rollback(ctx); rerr != nil {
+			return errors.Join(err, rerr)
+		}
+		return err
+	}
+	return sp.Commit(ctx) // RELEASE SAVEPOINT
 }
 
 // exec: 一个操作。RETURNING 0 行(update / delete)→ 同一个事务里再读一次,分出 NotFound / Conflict。
@@ -369,6 +447,9 @@ func constraintOf(pe *pgconn.PgError) string {
 	}
 	return pe.ColumnName
 }
+
+// IsRetryable: 序列化失败 / 死锁(40001 / 40P01)。InTx 会自己重来;在 InTx 外面自己管事务时用。
+func IsRetryable(err error) bool { return retryable(err) }
 
 func retryable(err error) bool {
 	var pe *pgconn.PgError

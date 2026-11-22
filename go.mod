@@ -6,6 +6,7 @@ require (
 	connectrpc.com/connect v1.21.1
 	connectrpc.com/validate v0.9.0
 	github.com/jackc/pgx/v5 v5.13.0
+	github.com/rabbitmq/amqp091-go v1.16.0
 	google.golang.org/protobuf v1.36.12
 )
 

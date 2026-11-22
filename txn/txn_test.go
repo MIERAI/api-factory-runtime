@@ -117,12 +117,20 @@ func TestFaultHeaderIgnoredInProduction(t *testing.T) {
 	}
 }
 
-// 数据库上的执行(TXN_TEST_DB=postgres://… 时运行): 原因的判定、回滚、故障注入。
-func TestExecutorOnDB(t *testing.T) {
+func testDB(t *testing.T) string {
 	url := os.Getenv("TXN_TEST_DB")
 	if url == "" {
-		t.Skip("TXN_TEST_DB not set")
+		url = os.Getenv("RUNTIME_TEST_DB")
 	}
+	if url == "" {
+		t.Skip("TXN_TEST_DB / RUNTIME_TEST_DB not set")
+	}
+	return url
+}
+
+// 数据库上的执行(TXN_TEST_DB 或 RUNTIME_TEST_DB=postgres://… 时运行): 原因的判定、回滚、故障注入。
+func TestExecutorOnDB(t *testing.T) {
+	url := testDB(t)
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, url)
 	if err != nil {
@@ -183,5 +191,108 @@ func TestExecutorOnDB(t *testing.T) {
 	}
 	if got := ReasonOf(e.Run(ctx, del)); got != NotFound {
 		t.Errorf("delete again: %s", got)
+	}
+}
+
+// AfterWrite: 不经过 RunIn 的写入(outbox)也计入"第 k 个写操作之后失败";生产环境(没有 WithFault)总是 nil。
+func TestAfterWriteWithoutDB(t *testing.T) {
+	if err := AfterWrite(context.Background(), "t"); err != nil {
+		t.Fatalf("no fault: %v", err)
+	}
+	// 不在 InTx 里: AfterWrite 不计数(没有事务的计数器)
+	if err := AfterWrite(WithFault(context.Background(), 1), "t"); err != nil {
+		t.Fatalf("outside InTx: %v", err)
+	}
+	st := &attemptState{}
+	ctx := context.WithValue(WithFault(context.Background(), 2), stateKey{}, st)
+	if err := AfterWrite(ctx, "a"); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if got := ReasonOf(AfterWrite(ctx, "factory_outbox")); got != Injected {
+		t.Fatalf("second write: %s", got)
+	}
+}
+
+// InTx / RunIn / Savepoint / AfterWrite 在数据库上: 保存点只回滚自己的写入;故障注入按整个事务计数;fn 的错误整个回滚。
+func TestInTxOnDB(t *testing.T) {
+	url := testDB(t)
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS txn_intx; CREATE TABLE txn_intx (k text PRIMARY KEY, v int NOT NULL CHECK (v >= 0))`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(ctx, `DROP TABLE txn_intx`)
+	e := New(conn)
+	ins := func(k string, v int32) Op {
+		return Op{Kind: Insert, Table: "txn_intx", Values: []Col{{Name: "k", Value: k}, {Name: "v", Value: v}}}
+	}
+	count := func(where string) int {
+		var n int
+		if err := conn.QueryRow(ctx, `SELECT count(*) FROM txn_intx WHERE `+where).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// 保存点: 第二个插入违反 CHECK → 只回滚保存点里的,外面的写入照样提交
+	var spErr error
+	err = e.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := RunIn(ctx, tx, ins("a", 1)); err != nil {
+			return err
+		}
+		spErr = Savepoint(ctx, tx, func(ctx context.Context, tx pgx.Tx) error {
+			return RunIn(ctx, tx, ins("b", 1), ins("c", -1))
+		})
+		return RunIn(ctx, tx, ins("d", 1))
+	})
+	if err != nil || ReasonOf(spErr) != Check {
+		t.Fatalf("savepoint: %v / %v", err, spErr)
+	}
+	if count(`k IN ('a','d')`) != 2 || count(`k IN ('b','c')`) != 0 {
+		t.Fatal("savepoint: wrong rows committed")
+	}
+	// fn 返回错误 → 整个回滚
+	boom := errors.New("boom")
+	if err := e.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		_ = RunIn(ctx, tx, ins("e", 1))
+		return boom
+	}); !errors.Is(err, boom) || count(`k = 'e'`) != 0 {
+		t.Fatalf("fn error: %v", err)
+	}
+	// 故障注入跨 RunIn / AfterWrite 计数: 第 3 个写 = AfterWrite
+	err = e.InTx(WithFault(ctx, 3), func(ctx context.Context, tx pgx.Tx) error {
+		if err := RunIn(ctx, tx, ins("f", 1)); err != nil {
+			return err
+		}
+		if err := RunIn(ctx, tx, ins("g", 1)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO txn_intx VALUES ('h', 1)`); err != nil {
+			return err
+		}
+		return AfterWrite(ctx, "txn_intx")
+	})
+	if ReasonOf(err) != Injected || count(`k IN ('f','g','h')`) != 0 {
+		t.Fatalf("fault across the transaction: %v", err)
+	}
+	// 保存点里的序列化失败: fn 吞掉了错误也要整个重来
+	calls := 0
+	err = e.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		calls++
+		_ = Savepoint(ctx, tx, func(ctx context.Context, tx pgx.Tx) error {
+			if calls == 1 {
+				_, err := tx.Exec(ctx, `DO $$ BEGIN RAISE EXCEPTION 'fake' USING ERRCODE = '40001'; END $$`)
+				return err
+			}
+			return nil
+		})
+		return RunIn(ctx, tx, ins("i", int32(calls)))
+	})
+	var v int
+	if err != nil || calls != 2 || conn.QueryRow(ctx, `SELECT v FROM txn_intx WHERE k = 'i'`).Scan(&v) != nil || v != 2 {
+		t.Fatalf("retry after a serialization failure in a savepoint: err=%v calls=%d v=%d", err, calls, v)
 	}
 }
