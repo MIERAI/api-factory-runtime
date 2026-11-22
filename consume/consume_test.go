@@ -22,7 +22,7 @@ func TestCrashHeaderIgnoredInProduction(t *testing.T) {
 		t.Fatalf("production must ignore %s: %q", message.HeaderCrash, p)
 	}
 	env := message.Envelope{ID: message.NewID()}
-	ctx, err := c.context(context.Background(), d, env)
+	ctx, err := c.context(context.Background(), d, env, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,8 +38,22 @@ func TestCrashHeaderIgnoredInProduction(t *testing.T) {
 		t.Fatalf("a redelivery must not crash again: %q", p)
 	}
 	d.Headers[message.HeaderFailAfter] = "zero"
-	if _, err := c.context(context.Background(), d, env); err == nil {
+	if _, err := c.context(context.Background(), d, env, 1); err == nil {
 		t.Fatal("malformed fail-after header must be an error in test mode")
+	}
+}
+
+// x-factory-fail-attempts: 生产环境无效(有效时的行为: TestProcessInProcess)。
+func TestFailAttemptsIgnoredInProduction(t *testing.T) {
+	t.Setenv(txn.TestFaultsEnv, "")
+	c := &Consumer{Queue: "q"}
+	d := Delivery{Headers: map[string]any{message.HeaderFailAttempts: "2"}}
+	ctx, err := c.context(context.Background(), d, message.Envelope{ID: message.NewID()}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.AfterWrite(ctx, "t"); err != nil {
+		t.Fatalf("production must ignore %s: %v", message.HeaderFailAttempts, err)
 	}
 }
 

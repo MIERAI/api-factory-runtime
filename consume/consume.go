@@ -206,7 +206,7 @@ func (c *Consumer) process(ctx context.Context, d Delivery) Result {
 		res.Outcome, res.Err = Poisoned, fmt.Errorf("handler %s does not accept %s v%d", c.Name, env.Type, env.Version)
 		return res
 	}
-	ctx, err = c.context(ctx, d, env)
+	ctx, err = c.context(ctx, d, env, attempt)
 	if err != nil {
 		res.Outcome, res.Err = Poisoned, err
 		return res
@@ -270,7 +270,7 @@ func (c *Consumer) call(ctx context.Context, tx pgx.Tx, env message.Envelope) (e
 
 // context: 处理器的 ctx: 平台时钟(处理开始的时刻;测试时 header x-factory-now)、追踪(收到的 traceparent 的子 span)、
 // 测试的故障注入(header x-factory-fail-after)。测试 header 写错了 → 错误(当毒消息: 测试写错了,不能悄悄不注入)。
-func (c *Consumer) context(ctx context.Context, d Delivery, env message.Envelope) (context.Context, error) {
+func (c *Consumer) context(ctx context.Context, d Delivery, env message.Envelope, attempt int) (context.Context, error) {
 	now, err := clock.FromHeader(headerView(d.Headers, message.HeaderNow, clock.Header), testClock(), time.Now)
 	if err != nil {
 		return ctx, err
@@ -282,6 +282,9 @@ func (c *Consumer) context(ctx context.Context, d Delivery, env message.Envelope
 	k, err := txn.FaultFromHeader(headerView(d.Headers, message.HeaderFailAfter, txn.FaultHeader), txn.TestFaultsEnabled())
 	if err != nil {
 		return ctx, err
+	}
+	if n, ok := message.HeaderInt(d.Headers, message.HeaderFailAttempts); ok && txn.TestFaultsEnabled() && k == 0 && attempt <= n {
+		k = 1 // 前 n 次: 第一个写操作之后失败
 	}
 	if k > 0 {
 		ctx = txn.WithFault(ctx, k)

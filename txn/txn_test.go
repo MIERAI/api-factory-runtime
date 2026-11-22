@@ -399,11 +399,26 @@ func TestExecutorR32OnDB(t *testing.T) {
 	if !errors.As(err, &te) || te.Reason != Unmet || te.Code != "INSUFFICIENT" || te.Op != 0 {
 		t.Errorf("unmet: %v", err)
 	}
+	// 条件不成立: Into = 现在的行(R4 的 跳过 按它判断);RunIn 之后事务还能用(没有 SQL 错误)
+	n, ver, logK = -1, -1, ""
+	err = e.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if err := RunIn(ctx, tx, adjust("a", -3, nil)[0]); ReasonOf(err) != Unmet {
+			t.Errorf("unmet in tx: %v", err)
+		}
+		return RunIn(ctx, tx, adjust("a", 0, nil)...) // 同一个事务里继续
+	})
+	if err != nil || logK != "a" || n != 2 || ver != 3 {
+		t.Errorf("after unmet: %v k=%q n=%d ver=%d (want the row read by explain, then the next update)", err, logK, n, ver)
+	}
+	n, ver, logK = -1, -1, ""
+	if err := e.Run(ctx, adjust("a", -3, nil)[0]); ReasonOf(err) != Unmet || logK != "a" || n != 2 || ver != 3 {
+		t.Errorf("unmet: Into = the current row: %v k=%q n=%d ver=%d", err, logK, n, ver)
+	}
 	stale := int32(1)
 	if got := ReasonOf(e.Run(ctx, adjust("a", -3, &stale)...)); got != Conflict { // 版本不一致 先于 条件
 		t.Errorf("stale version + unmet condition: %s", got)
 	}
-	cur := int32(2)
+	cur := int32(3)
 	if got := ReasonOf(e.Run(ctx, adjust("a", -3, &cur)...)); got != Unmet {
 		t.Errorf("right version + unmet condition: %s", got)
 	}
@@ -417,8 +432,8 @@ func TestExecutorR32OnDB(t *testing.T) {
 		}
 	}
 	var cnt int
-	if err := conn.QueryRow(ctx, `SELECT n * 100 + (SELECT count(*) FROM txn_log) FROM txn_stock WHERE k = 'a'`).Scan(&cnt); err != nil || cnt != 201 {
-		t.Errorf("state after failures: %d %v (want n=2, 1 log row)", cnt, err)
+	if err := conn.QueryRow(ctx, `SELECT n * 100 + (SELECT count(*) FROM txn_log) FROM txn_stock WHERE k = 'a'`).Scan(&cnt); err != nil || cnt != 202 {
+		t.Errorf("state after failures: %d %v (want n=2, 2 log rows)", cnt, err)
 	}
 	// 幂等新建
 	var amount string

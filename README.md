@@ -91,6 +91,8 @@ handlers. **No ordering is guaranteed**, not even per subject: handlers must be 
   `PRECONDITION_FAILED`) instead of being changed silently.
 - `DefaultRetry` = tiers 1s/10s/60s, max 5 attempts (delays 1s, 10s, 60s, 60s). `QueueName`, `RetryQueue`, `DLQ`.
 - One vhost per environment, chosen by `AMQP_URL` (e.g. `amqp://user:pass@rabbitmq:5672/prod`).
+- `Ensure(ctx, conn, Spec)` (v0.4.2): the start-up task of generated services: declares the spec, retrying with
+  backoff (1s → 30s) while RabbitMQ is unreachable; a declaration the server rejects is returned (start-up fails).
 
 ### `leader`
 
@@ -114,6 +116,20 @@ handlers. **No ordering is guaranteed**, not even per subject: handlers must be 
   deadlock) and classification as `Run` (now `Run` = `InTx` + `RunIn`). `RunIn(ctx, tx, ops...)`,
   `Savepoint(ctx, tx, fn)` (roll back only the savepoint; a serialization failure inside still restarts the whole
   transaction), `AfterWrite(ctx, table)`, `IsRetryable(err)`.
+- v0.4.2: when an update / delete touches no row but the row exists (`Conflict` / `Unmet`), `Into` holds the row read
+  in the same transaction. Message handlers use it for "condition unmet = skip" (look at the current row: a
+  reservation already `COMMITTED` = a resend, `RELEASED` = an anomaly). Callers that got an error before never read
+  `Into`, so nothing changes for them.
+
+### `message` / `consume` additions (v0.4.2)
+
+- `message.DecodeData(env, m)`: `env.Data` → the generated proto message of the contract (protojson, unknown fields
+  ignored) + its protovalidate rules (required / ranges / counts / unique list keys); failures are `*DecodeError`
+  (poison). `message.EncodeData(m)`: proto field names, zero values written.
+- `consume.TestHandler(consumers...)`: `POST /factory.test/deliver` hands one message to a consumer's `Process`
+  (decode, dedup, handler, commit) without RabbitMQ and returns the outcome — the in-process layer of the generated
+  services' differential tests. Mounted by the generated wiring, answers only with `FACTORY_TEST_FAULTS=1` (404
+  otherwise, unit-tested).
 
 ### Test hooks (test environments only)
 
@@ -123,7 +139,8 @@ Only with `FACTORY_TEST_FAULTS=1`; production ignores them (unit-tested):
 |---|---|
 | `FACTORY_TEST_RELAY_CRASH=after_publish[:n]` / `after_confirm[:n]` | The relay calls `os.Exit(137)` in batch `n` (default 1) after publishing / after the confirms, before marking |
 | AMQP header `x-factory-crash: before_commit` / `after_commit` / `after_retry_publish` | The consumer exits 137 at that point (first delivery only; copies drop the header) |
-| AMQP header `x-factory-fail-after: k` | Like HTTP `X-Factory-Fail-After`: the handler's transaction fails after write `k` |
+| AMQP header `x-factory-fail-after: k` | Like HTTP `X-Factory-Fail-After`: the handler's transaction fails after write `k` (copies keep the header: every attempt fails → DLQ) |
+| AMQP header `x-factory-fail-attempts: n` (v0.4.2) | The first `n` attempts fail after their first write (transient → retry queue), attempt `n+1` runs normally: the "retry, then succeed" path |
 | AMQP header `x-factory-now` (with `FACTORY_TEST_CLOCK=1`) | Fixes `clock.Now` in the handler |
 
 ### Integration tests
