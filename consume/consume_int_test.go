@@ -540,3 +540,36 @@ func TestProcessInProcess(t *testing.T) {
 		t.Fatalf("fail-attempts #2: %+v", r)
 	}
 }
+
+// G19 / G20: WaitFor 关闭之前不订阅(队列还没声明: 不会 NOT_FOUND + 退避);关闭之后马上订阅,订阅成功调用 Subscribed。
+func TestWaitForTopology(t *testing.T) {
+	e := setup(t)
+	typ := "evt.late." + itest.Suffix()
+	spec := topology.Spec{Retry: fastRetry, Queues: []topology.Queue{{Name: topology.QueueName("rt-consumer", typ),
+		Subscriptions: []topology.Subscription{{Kind: message.Event, Type: typ}}}}}
+	t.Cleanup(func() {
+		if ch, err := e.b.Channel(context.Background()); err == nil {
+			_ = topology.Delete(ch, spec)
+			_ = ch.Close()
+		}
+	})
+	ready := make(chan struct{})
+	var subscribed atomic.Int32
+	c := &consume.Consumer{Queue: spec.Queues[0].Name, Handler: func(ctx context.Context, tx pgx.Tx, m message.Envelope) error { return nil },
+		Exec: txn.New(e.pool), Broker: e.b, Retry: fastRetry, Log: quiet, DLQCheckEvery: -1,
+		WaitFor: ready, Subscribed: func() { subscribed.Add(1) }}
+	run(t, c)
+	time.Sleep(300 * time.Millisecond)
+	if subscribed.Load() != 0 {
+		t.Fatal("subscribed before the topology signal")
+	}
+	if err := topology.Declare(e.ch, spec); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	close(ready)
+	itest.Eventually(t, 5*time.Second, "subscribed after the signal", func() bool { return subscribed.Load() == 1 })
+	if d := time.Since(start); d > 900*time.Millisecond { // 失败过一次就会有 ≥ 1s 的退避
+		t.Fatalf("subscribing took %s: the consumer must not have tried (and backed off) before the signal", d)
+	}
+}

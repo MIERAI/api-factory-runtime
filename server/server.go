@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -88,8 +90,16 @@ func loadConfig() (config, error) {
 }
 
 // Run 启动服务,直到收到 SIGINT/SIGTERM。
+//
+// 子命令 probe(`/server probe`): 请求本进程 PORT 上的 /readyz,200 → 退出码 0,其他 → 1。distroless 镜像里没有
+// shell / curl,生成的 Dockerfile 用它写 HEALTHCHECK(docker / compose 用;k8s 直接探 /readyz)。
 func Run(build Builder) {
+	if len(os.Args) > 1 && os.Args[1] == "probe" {
+		os.Exit(probe(os.Stderr))
+	}
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// 运行时的后台任务(中继、消费循环、选主、超时扫描)没有传 Logger 时用 slog.Default(): 同一个进程的日志都是 JSON
+	slog.SetDefault(log)
 	if err := run(log, build); err != nil {
 		log.Error("server exited", "err", err)
 		os.Exit(1)
@@ -196,7 +206,7 @@ func run(log *slog.Logger, build Builder) error {
 	//   /readyz 准备好接流量(停机开始后 503,先被摘出 Service)→ readiness
 	//   /healthz 深度检查(数据库能 ping 通): 外部探针 SLO、部署后的 smoke test
 	var stopping atomic.Bool
-	addProbes(mux, &stopping)
+	addProbes(mux, &stopping, deps.Workers.Pending)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		pingCtx, cancel := context.WithTimeout(r.Context(), time.Second)
 		defer cancel()
@@ -246,16 +256,38 @@ func run(log *slog.Logger, build Builder) error {
 	}
 }
 
-// addProbes: /livez 和 /readyz,都不碰数据库(见 Run 里的说明)。
-func addProbes(mux *http.ServeMux, stopping *atomic.Bool) {
+// addProbes: /livez 和 /readyz,都不碰数据库(见 Run 里的说明)。pending = 还没满足的"准备好了"的条件
+// (Workers.Ready: 拓扑声明好了、消费循环订阅了;没有 AMQP_URL 时没有条件)。
+func addProbes(mux *http.ServeMux, stopping *atomic.Bool, pending func() []string) {
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if stopping.Load() {
 			http.Error(w, "shutting down", http.StatusServiceUnavailable)
 			return
 		}
+		if p := pending(); len(p) > 0 {
+			http.Error(w, "not ready: "+strings.Join(p, ", "), http.StatusServiceUnavailable)
+			return
+		}
 		_, _ = w.Write([]byte("ok"))
 	})
+}
+
+// probe: GET http://127.0.0.1:$PORT/readyz(上限 2s)。返回退出码。
+func probe(stderr io.Writer) int {
+	c := &http.Client{Timeout: 2 * time.Second}
+	resp, err := c.Get("http://127.0.0.1:" + envOr("PORT", "8080") + "/readyz")
+	if err != nil {
+		fmt.Fprintln(stderr, "probe:", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(stderr, "probe: /readyz %d %s\n", resp.StatusCode, strings.TrimSpace(string(body)))
+		return 1
+	}
+	return 0
 }
 
 func newLoggingInterceptor(log *slog.Logger) connect.UnaryInterceptorFunc {

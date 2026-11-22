@@ -27,8 +27,12 @@ const LockName = "factory.outbox.relay"
 // 一轮:
 //  1. SELECT 未发送的行 ORDER BY seq LIMIT Batch(在持锁的连接上;不加行锁,不在事务里做网络 IO)
 //  2. 在 confirm 模式的 channel 上逐条发布: 持久化;message_id = envelope.id,type / traceparent 也放进 AMQP 属性;
-//     命令开 mandatory(没有队列接收 = 配置错误,当作失败留在 outbox 里),事件不开(没有订阅者是正常的)
-//  3. 等这一批的 confirm: ack 的 → published_at = now();nack / 超时 / 退回 → attempts + 1、last_error,
+//     都开 mandatory(没有队列接收 → RabbitMQ 退回):
+//     - 命令: 退回 = 配置错误,当作失败留在 outbox 里(按退避再试,队列声明之后就发出去)
+//     - 事件: 退回 = 没有任何订阅队列(系统级的拓扑没有声明,或者真的没人订阅)。标成已发送(不堵 outbox:
+//     系统外的订阅者 / 可选的事件可能永远没有队列),但不悄悄地: last_error = "unroutable: …"、
+//     factory_outbox_unroutable_total{kind="event",type} + ERROR 日志(告警看这个计数)
+//  3. 等这一批的 confirm: ack 的 → published_at = now();nack / 超时 / 退回的命令 → attempts + 1、last_error,
 //     这一行按 1s → 30s 的退避再试(别的行照常发)
 //  4. 每小时: 删除发送超过 Retention 的行、处理超过 DedupRetention 的去重记录(每次 ≤ 1000 行)
 //
@@ -265,7 +269,7 @@ WHERE published_at IS NULL AND seq <> ALL($2::bigint[]) ORDER BY seq LIMIT $1`, 
 		if tp != "" {
 			pub.Headers[message.HeaderTraceparent] = tp
 		}
-		confirms[i], err = ch.PublishWithDeferredConfirmWithContext(bctx, ex, x.typ, x.kind == message.Command, false, pub)
+		confirms[i], err = ch.PublishWithDeferredConfirmWithContext(bctx, ex, x.typ, true, false, pub)
 		if err != nil {
 			pubErr = err
 			break
@@ -300,15 +304,25 @@ WHERE published_at IS NULL AND seq <> ALL($2::bigint[]) ORDER BY seq LIMIT $1`, 
 			metrics.OutboxPublishError("nack", 1)
 		}
 	}
-	for done := false; !done; { // 退回的(mandatory 的命令没有队列接收)
+	unroutable := map[int64]string{} // 退回的事件: 标成已发送,记下 last_error
+	for done := false; !done; {      // 退回的(mandatory: 没有队列接收)
 		select {
 		case ret := <-returns:
 			for _, x := range batch {
-				if x.id == ret.MessageId {
-					failed[x.seq] = fmt.Sprintf("unroutable: %d %s (exchange %s, routing key %s)", ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
-					metrics.OutboxPublishError("unroutable", 1)
-					r.Log.Error("outbox relay: command has no queue (configuration error)", "type", x.typ, "id", x.id)
+				if x.id != ret.MessageId {
+					continue
 				}
+				why := fmt.Sprintf("unroutable: %d %s (exchange %s, routing key %s)", ret.ReplyCode, ret.ReplyText, ret.Exchange, ret.RoutingKey)
+				if x.kind == message.Command {
+					failed[x.seq] = why
+					metrics.OutboxPublishError("unroutable", 1)
+					metrics.OutboxUnroutable("command", x.typ)
+					r.Log.Error("outbox relay: command has no queue (configuration error); kept in the outbox and retried", "type", x.typ, "id", x.id)
+					continue
+				}
+				unroutable[x.seq] = why
+				metrics.OutboxUnroutable("event", x.typ)
+				r.Log.Error("outbox relay: event has no subscriber queue and is dropped (is the system topology applied?)", "type", x.typ, "id", x.id)
 			}
 		default:
 			done = true
@@ -328,6 +342,13 @@ WHERE published_at IS NULL AND seq <> ALL($2::bigint[]) ORDER BY seq LIMIT $1`, 
 			return 0, err
 		}
 		metrics.OutboxPublished(len(ok))
+	}
+	for _, x := range batch { // 退回的事件: 发出去了但没人收 —— outbox 里留下记录(运维查 last_error LIKE 'unroutable%')
+		if why, bad := unroutable[x.seq]; bad {
+			if _, err := conn.Exec(bctx, `UPDATE factory_outbox SET last_error = $2 WHERE seq = $1`, x.seq, why); err != nil {
+				return 0, err
+			}
+		}
 	}
 	if err := r.markFailed(bctx, conn, batch, failed); err != nil {
 		return 0, err

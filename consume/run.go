@@ -31,6 +31,15 @@ func (c *Consumer) Run(ctx context.Context) error {
 	case c.Broker == nil:
 		return fmt.Errorf("consume %s: Broker is required", c.Queue)
 	}
+	if c.WaitFor != nil { // 先等拓扑(冷启动时不再每个队列一条 NOT_FOUND + 退避)
+		select {
+		case <-c.WaitFor:
+		case <-ctx.Done():
+			return nil
+		case <-time.After(c.WaitLimit):
+			c.Log.Warn("consumer: topology not ready yet; subscribing anyway (retries while the queue does not exist)", "queue", c.Queue, "waited", c.WaitLimit)
+		}
+	}
 	if c.DLQCheckEvery > 0 {
 		go c.watchDLQ(ctx)
 	}
@@ -75,6 +84,9 @@ func (c *Consumer) session(ctx context.Context) error {
 		return err
 	}
 	c.Log.Info("consumer: subscribed", "queue", c.Queue, "prefetch", c.Prefetch)
+	if c.Subscribed != nil {
+		c.Subscribed()
+	}
 
 	// 正在处理的消息不跟着 ctx 取消: 停机时做完(上限 Timeout)
 	pctx := context.WithoutCancel(ctx)

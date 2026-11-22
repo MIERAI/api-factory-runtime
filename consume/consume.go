@@ -64,6 +64,13 @@ type Consumer struct {
 	DLQCheckEvery time.Duration        // 多久查一次 DLQ 的长度(默认 30s;< 0 = 不查)
 	Log           *slog.Logger
 
+	// 启动的顺序(G19 / G20;生成的 wiring 用 server.Workers.Ready 的信号):
+	//   WaitFor     第一次订阅之前先等它关闭(拓扑声明好了),最多 WaitLimit(默认 60s;等不到照常订阅,队列不存在就退避重试)
+	//   Subscribed  每次订阅成功之后调用(/readyz 等"每个消费循环都订阅了")
+	WaitFor    <-chan struct{}
+	WaitLimit  time.Duration
+	Subscribed func()
+
 	once sync.Once
 }
 
@@ -156,6 +163,9 @@ func (c *Consumer) setDefaults() {
 	}
 	if c.Log == nil {
 		c.Log = slog.Default()
+	}
+	if c.WaitLimit <= 0 {
+		c.WaitLimit = time.Minute
 	}
 }
 

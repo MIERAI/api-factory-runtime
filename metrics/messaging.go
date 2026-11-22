@@ -8,6 +8,7 @@ package metrics
 //	factory_relay_leader                         gauge     这个进程的中继是不是工作者(1 / 0)
 //	factory_outbox_published_total               counter   发出并确认的消息数
 //	factory_outbox_publish_errors_total{reason}  counter   发送失败(nack / timeout / unroutable / broker)
+//	factory_outbox_unroutable_total{kind,type}   counter   没有队列接收的消息(命令: 留在 outbox 重试;事件: 丢弃)
 //	factory_messages_total{handler,outcome}      counter   ok / business / duplicate / retry / dlq / poison
 //	factory_handler_panics_total{handler}        counter   处理器 panic(当暂时性错误重试)
 //	factory_message_lag_seconds{handler}         histogram 提交时刻 − occurred_at
@@ -36,6 +37,7 @@ var (
 	outbox        outboxState
 	published     uint64
 	publishErrors = map[string]uint64{}
+	unroutable    = map[[2]string]uint64{} // {kind, type}
 	messages      = map[[2]string]uint64{} // {handler, outcome}
 	panics        = map[string]uint64{}
 	lagHist       = map[string]*hist{}
@@ -72,6 +74,13 @@ func OutboxPublishError(reason string, n int) {
 	mu.Lock()
 	defer mu.Unlock()
 	publishErrors[reason] += uint64(n)
+}
+
+// OutboxUnroutable: 一条消息被 RabbitMQ 退回(mandatory: 没有队列接收)。kind = event / command。
+func OutboxUnroutable(kind, typ string) {
+	mu.Lock()
+	defer mu.Unlock()
+	unroutable[[2]string{kind, typ}]++
 }
 
 // Message: 一条消息的处理结果。
@@ -147,6 +156,13 @@ func WriteMessaging(w io.Writer) {
 			fmt.Fprintf(w, "factory_outbox_publish_errors_total{reason=%q} %d\n", k, publishErrors[k])
 		}
 	}
+	if len(unroutable) > 0 {
+		fmt.Fprintln(w, "# HELP factory_outbox_unroutable_total Messages returned by the broker because no queue is bound (commands stay in the outbox; events are dropped).")
+		fmt.Fprintln(w, "# TYPE factory_outbox_unroutable_total counter")
+		for _, k := range sorted2(unroutable) {
+			fmt.Fprintf(w, "factory_outbox_unroutable_total{kind=%q,type=%q} %d\n", k[0], k[1], unroutable[k])
+		}
+	}
 	if len(messages) > 0 {
 		fmt.Fprintln(w, "# HELP factory_messages_total Messages handled, by handler and outcome (ok, business, duplicate, retry, dlq, poison).")
 		fmt.Fprintln(w, "# TYPE factory_messages_total counter")
@@ -216,7 +232,15 @@ func resetMessaging() { // 测试用
 	defer mu.Unlock()
 	outbox, published = outboxState{}, 0
 	publishErrors, messages, panics = map[string]uint64{}, map[[2]string]uint64{}, map[string]uint64{}
+	unroutable = map[[2]string]uint64{}
 	lagHist, durHist, dlqSize = map[string]*hist{}, map[string]*hist{}, map[string]int64{}
+}
+
+// UnroutableCount: 测试用的读数(kind × type 被退回的次数)。
+func UnroutableCount(kind, typ string) uint64 {
+	mu.Lock()
+	defer mu.Unlock()
+	return unroutable[[2]string{kind, typ}]
 }
 
 // MessageCount: 测试用的读数(某个 handler × outcome 的计数)。

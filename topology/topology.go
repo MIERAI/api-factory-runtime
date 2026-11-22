@@ -28,8 +28,8 @@ import (
 
 // Exchanges: 两个交换机的名字。
 type Exchanges struct {
-	Events   string // topic
-	Commands string // direct
+	Events   string `json:"events"`   // topic
+	Commands string `json:"commands"` // direct
 }
 
 // DefaultExchanges: factory.events / factory.commands。
@@ -212,7 +212,10 @@ func Delete(ch Deleter, s Spec) error {
 
 // Ensure: 服务启动时声明 s(生成的 wiring 的后台任务调用)。RabbitMQ 连不上 → 退避(1s → 30s)重试,直到 ctx 结束
 // (返回 nil);连上之后声明的错误(参数和已有的不一致 = PRECONDITION_FAILED 等)→ 返回错误 = 启动失败(不悄悄改)。
-// 消费循环在队列声明好之前订阅失败也会自己重试,所以不用等 Ensure。
+// 生成的 wiring 在它成功之后给出"拓扑准备好了"的信号(server.Workers.Ready):消费循环等这个信号再订阅,/readyz 也等它。
+//
+// 系统级的拓扑(Manifest,平台在部署服务之前声明)和每个服务自己的 Ensure 声明的是同样的东西(幂等):
+// 平台先声明 = 订阅方第一次启动之前发出的事件也有队列接收(G23);服务自己的 Ensure 留着 = 单独跑一个服务也能用。
 func Ensure(ctx context.Context, conn *broker.Conn, s Spec) error {
 	var backoff time.Duration
 	for {
