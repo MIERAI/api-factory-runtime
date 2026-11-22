@@ -10,7 +10,7 @@ factory itself — the generator, the core algebra, the verification — is a se
 | `apierr` | Maps database and validation errors to Connect error codes |
 | `paging` | Keyset page tokens: signed, bound to the request's filters |
 | `shard` | Routes a request to one of several databases by a shard key (e.g. per store) |
-| `txn` | The transaction executor of commands (writes): runs write operations given as data in one transaction (READ COMMITTED), tells "not found" from "version conflict" when an update/delete touches no row, classifies database errors (unique / check / not null / foreign key), retries serialization failures and deadlocks; test-only fault injection (`FACTORY_TEST_FAULTS=1` + `X-Factory-Fail-After`) |
+| `txn` | The transaction executor of commands (writes): runs write operations given as data in one transaction (READ COMMITTED), tells "not found" from "version conflict" when an update/delete touches no row, classifies database errors (unique / check / not null / foreign key); conditional updates (`Cond` + a business reason code `Unmet`), idempotent inserts (`Conflict`: `ON CONFLICT DO NOTHING` + read the existing row, `Created`), later operations using earlier results (`Later`); retries serialization failures and deadlocks; test-only fault injection (`FACTORY_TEST_FAULTS=1` + `X-Factory-Fail-After`) |
 | `clock` | The request's start time (`now()` in queries); in tests (`FACTORY_TEST_CLOCK=1`) the header `X-Factory-Now` fixes it |
 | `conv` | Conversions between database and protobuf types (decimal, date, timestamp) |
 | `metrics` | Request counts and latency histograms in the Prometheus text format (no dependency); messaging metrics (outbox backlog, consumer outcomes, lag, DLQ size) |
