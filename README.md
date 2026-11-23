@@ -1,5 +1,22 @@
 # api-factory-runtime
 
+> **Moved (2026-11-23).** The runtime now lives in the factory's repository as its own Go module:
+> **[`github.com/MIERAI/api-factory/runtime`](https://github.com/MIERAI/api-factory/tree/main/runtime)**, released
+> together with the factory (factory `vX.Y.Z` ↔ tag `runtime/vX.Y.Z`, starting at v0.6.0). Its history was moved
+> with it. This repository is no longer developed: v0.5.2 is its last release, and existing tags keep resolving
+> (`go get github.com/MIERAI/api-factory-runtime@v0.5.2` still works).
+>
+> To move a project: `factory upgrade --project DIR` (api-factory v0.6.0 or later) rewrites the module path and the
+> version in go.mod and in the imports, then runs `go mod tidy` and `go build ./...`. By hand:
+>
+> ```sh
+> go mod edit -droprequire=github.com/MIERAI/api-factory-runtime -require=github.com/MIERAI/api-factory/runtime@v0.6.0
+> grep -rl github.com/MIERAI/api-factory-runtime --include='*.go' . | xargs sed -i 's#github.com/MIERAI/api-factory-runtime#github.com/MIERAI/api-factory/runtime#g'
+> go mod tidy && go build ./...
+> ```
+>
+> Issues and pull requests: [MIERAI/api-factory](https://github.com/MIERAI/api-factory).
+
 The runtime library of the services that **api-factory** generates: everything a generated service needs at run time,
 nothing it needs at generation time. Generated code imports only this module (and its own generated packages); the
 factory itself — the generator, the core algebra, the verification — is a separate, private project.
