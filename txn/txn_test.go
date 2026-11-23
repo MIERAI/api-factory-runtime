@@ -3,6 +3,7 @@ package txn
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"reflect"
@@ -456,5 +457,78 @@ func TestExecutorR32OnDB(t *testing.T) {
 	}
 	if got := ReasonOf(e.Run(ctx, pay(2, "5", "r1"))); got != Unique { // 别的唯一约束: 不是幂等键 → 已存在
 		t.Errorf("other unique constraint: %s", got)
+	}
+}
+
+// AfterCommit: 只在提交成功之后调用(回滚 / 提交失败 / 重来的那次尝试都不调用);同一个 key 一个事务只调一次;
+// 不在 InTx 里 → 不登记。
+func TestAfterCommitOnDB(t *testing.T) {
+	url := testDB(t)
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS txn_hook; CREATE TABLE txn_hook (k text PRIMARY KEY, v int NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Exec(ctx, `DROP TABLE txn_hook`)
+	e := New(conn)
+	type keyA struct{}
+	type keyB struct{}
+	var calls []string
+	var dbs []Beginner
+	reg := func(ctx context.Context, name string, key any) bool {
+		return AfterCommit(ctx, key, func(db Beginner) {
+			// 回调时事务已经提交: 用执行器的连接能看到提交的行
+			var n int
+			_ = conn.QueryRow(context.Background(), `SELECT count(*) FROM txn_hook`).Scan(&n)
+			calls = append(calls, fmt.Sprintf("%s:%d", name, n))
+			dbs = append(dbs, db)
+		})
+	}
+	if reg(ctx, "outside", keyA{}) {
+		t.Fatal("AfterCommit outside InTx must not register")
+	}
+	// 提交: 同一个 key 只一次,按登记顺序
+	if err := e.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO txn_hook VALUES ('a', 1)`); err != nil {
+			return err
+		}
+		if !reg(ctx, "a1", keyA{}) || !reg(ctx, "a2", keyA{}) || !reg(ctx, "b", keyB{}) {
+			t.Error("AfterCommit in InTx must register")
+		}
+		if len(calls) != 0 {
+			t.Error("hook called before commit")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(calls, ",") != "a1:1,b:1" || len(dbs) != 2 || dbs[0] != Beginner(conn) {
+		t.Fatalf("after commit: %v", calls)
+	}
+	calls = nil
+	// 回滚: 不调用
+	_ = e.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		reg(ctx, "rolled-back", keyA{})
+		return errors.New("boom")
+	})
+	// 重来: 第一次尝试(序列化失败)登记的不调用,第二次的调用一次
+	attempt := 0
+	if err := e.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		attempt++
+		reg(ctx, fmt.Sprintf("attempt%d", attempt), keyA{})
+		if attempt == 1 {
+			_, err := tx.Exec(ctx, `DO $$ BEGIN RAISE EXCEPTION 'fake' USING ERRCODE = '40001'; END $$`)
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(calls, ",") != "attempt2:1" {
+		t.Fatalf("rollback / retry: %v", calls)
 	}
 }

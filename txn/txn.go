@@ -188,7 +188,7 @@ func (e *Executor) once(ctx context.Context, fn func(ctx context.Context, tx pgx
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	st := &attemptState{} // 每次尝试从头开始: 故障注入的计数、保存点里遇到的序列化失败
+	st := &attemptState{} // 每次尝试从头开始: 故障注入的计数、保存点里遇到的序列化失败、提交后的回调
 	ctx = context.WithValue(ctx, stateKey{}, st)
 	ferr := fn(ctx, tx)
 	if st.retry != nil { // 保存点里遇到了序列化失败 / 死锁: 不管 fn 怎么处理了那个错误,整个事务重来
@@ -199,6 +199,9 @@ func (e *Executor) once(ctx context.Context, fn func(ctx context.Context, tx pgx
 	}
 	if err := tx.Commit(ctx); err != nil { // 提交时的错误(序列化失败 → 重试;延迟检查的约束 → 原因)
 		return classify(-1, Op{Table: "(commit)"}, err)
+	}
+	for _, h := range st.hooks {
+		h.fn(e.db)
 	}
 	return nil
 }
@@ -247,8 +250,35 @@ func afterWrite(ctx context.Context, i int, table string) error {
 type stateKey struct{}
 
 type attemptState struct {
-	writes int   // 这次尝试里做过的写操作(故障注入)
-	retry  error // 保存点里遇到的序列化失败 / 死锁
+	writes int    // 这次尝试里做过的写操作(故障注入)
+	retry  error  // 保存点里遇到的序列化失败 / 死锁
+	hooks  []hook // 提交成功之后按登记的顺序调用(回滚 / 重来的尝试 → 丢弃)
+}
+
+type hook struct {
+	key any
+	fn  func(db Beginner)
+}
+
+// AfterCommit: 在 InTx 的 fn 里登记一个回调,这个事务提交成功之后调用(参数是执行器的连接 —— 提交之后的连接,
+// 不在事务里)。同一个事务里同一个 key 只登记一次(第一次的 fn)。回滚 / 序列化失败重来的那次尝试的回调不调用
+// (重来时 fn 会再登记)。回调在 InTx 返回之前同步调用: 要做 IO 的回调自己转到后台(outbox 的唤醒就是这样)。
+// 不在 InTx 里 → 不登记,返回 false。
+//
+// 用途: 只该在提交之后发生、又不该拉长事务的事情。outbox.Writer 用它在提交之后唤醒中继(NOTIFY 不放在写事务里:
+// 发过 NOTIFY 的事务在提交时持有整个实例的一把锁直到 WAL 落盘,所有写 outbox 的提交会因此排成一队)。
+func AfterCommit(ctx context.Context, key any, fn func(db Beginner)) bool {
+	st, _ := ctx.Value(stateKey{}).(*attemptState)
+	if st == nil {
+		return false
+	}
+	for _, h := range st.hooks {
+		if h.key == key {
+			return true
+		}
+	}
+	st.hooks = append(st.hooks, hook{key: key, fn: fn})
+	return true
 }
 
 // Savepoint: 在 tx 里开一个保存点执行 fn。fn 返回错误 → 只回滚到保存点(之前的写入和 tx 都还在),返回 fn 的错误;

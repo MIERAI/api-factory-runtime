@@ -1,6 +1,7 @@
 // Package outbox: 写操作发出的消息先在同一个事务里写进 outbox 表,再由中继(Relay)发到 RabbitMQ(R4 设计稿 §3)。
 //
-//	写入   Writer.Write(ctx, tx, msgs…): 在调用方的事务(txn.Executor.InTx 的 tx)里 INSERT factory_outbox + NOTIFY。
+//	写入   Writer.Write(ctx, tx, msgs…): 在调用方的事务(txn.Executor.InTx 的 tx)里 INSERT factory_outbox;
+//	       提交之后在事务外 NOTIFY 唤醒中继(合并发送,见 notify.go;NOTIFY 不在写事务里)。
 //	       事务回滚 → 没有消息;提交 → 消息一定会被发出(至少一次,id 不变)。
 //	中继   Relay.Run(ctx): 每个数据库同时只有一个在工作(advisory lock,E3),按 seq 批量发布、等 publisher confirm、
 //	       确认了才标记 published_at。崩在发布之后、标记之前 → 重启后同一条消息(同一个 id、逐字节相同)再发一次,
@@ -32,6 +33,7 @@ var PlatformSQL string
 const PlatformFile = "zz_factory_platform.sql"
 
 // NotifyChannel: 写入提交后唤醒中继的 NOTIFY 频道(只是唤醒,丢了也没关系: 中继另有轮询)。
+// 提交之后在事务外发(v0.5.2 起;以前在写事务里发,会让所有写 outbox 的提交在实例上串行)。
 const NotifyChannel = "factory_outbox"
 
 // Message: 要发出的一条消息(生成的代码按设计稿的 `发出:` 组装)。
@@ -57,9 +59,11 @@ func NewWriter(source string) *Writer { return &Writer{Source: source} }
 //   - occurred_at = clock.Now(ctx)(请求开始的时刻;测试时可以固定)
 //   - traceparent = message.Traceparent(ctx)(HTTP 请求头 / 正在处理的消息)
 //   - 每一行计入测试的故障注入(txn.AfterWrite): "outbox 写入之后、提交之前"失败 → 没有消息
-//   - 写完 NOTIFY factory_outbox(提交时才送达;回滚就没有)
+//   - 提交成功之后(txn.AfterCommit)在事务外 NOTIFY factory_outbox 唤醒中继,按连接池合并;回滚就没有。
+//     写事务本身不发 NOTIFY(见 notify.go: 那会让所有写 outbox 的提交在实例上串行)
 //
-// 必须在调用方的事务里调用(txn.Executor.InTx 的 tx);事务的提交 / 回滚由调用方决定。
+// 必须在调用方的事务里调用(txn.Executor.InTx 的 tx);事务的提交 / 回滚由调用方决定。不在 InTx 里调用时
+// 没有提交后的唤醒: 消息照样会发出,由中继的轮询(Poll)取走。
 func (w *Writer) Write(ctx context.Context, tx pgx.Tx, msgs ...Message) ([]message.Envelope, error) {
 	if len(msgs) == 0 {
 		return nil, nil
@@ -99,11 +103,11 @@ VALUES ($1::uuid, $2::smallint, $3::text, $4::integer, $5::text, $6::jsonb, $7::
 		}
 		envs = append(envs, env)
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_notify('`+NotifyChannel+`', '')`); err != nil {
-		return nil, fmt.Errorf("outbox: notify: %w", err)
-	}
+	txn.AfterCommit(ctx, wakeupKey{}, kick)
 	return envs, nil
 }
+
+type wakeupKey struct{} // 一个事务里不管写了几次 outbox,提交后只唤醒一次
 
 func encodeData(v any) (json.RawMessage, error) {
 	var b []byte

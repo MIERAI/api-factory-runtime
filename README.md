@@ -10,7 +10,7 @@ factory itself — the generator, the core algebra, the verification — is a se
 | `apierr` | Maps database and validation errors to Connect error codes |
 | `paging` | Keyset page tokens: signed, bound to the request's filters |
 | `shard` | Routes a request to one of several databases by a shard key (e.g. per store) |
-| `txn` | The transaction executor of commands (writes): runs write operations given as data in one transaction (READ COMMITTED), tells "not found" from "version conflict" when an update/delete touches no row, classifies database errors (unique / check / not null / foreign key); conditional updates (`Cond` + a business reason code `Unmet`), idempotent inserts (`Conflict`: `ON CONFLICT DO NOTHING` + read the existing row, `Created`), later operations using earlier results (`Later`); retries serialization failures and deadlocks; test-only fault injection (`FACTORY_TEST_FAULTS=1` + `X-Factory-Fail-After`) |
+| `txn` | The transaction executor of commands (writes): runs write operations given as data in one transaction (READ COMMITTED), tells "not found" from "version conflict" when an update/delete touches no row, classifies database errors (unique / check / not null / foreign key); conditional updates (`Cond` + a business reason code `Unmet`), idempotent inserts (`Conflict`: `ON CONFLICT DO NOTHING` + read the existing row, `Created`), later operations using earlier results (`Later`); after-commit callbacks (`AfterCommit`); retries serialization failures and deadlocks; test-only fault injection (`FACTORY_TEST_FAULTS=1` + `X-Factory-Fail-After`) |
 | `clock` | The request's start time (`now()` in queries); in tests (`FACTORY_TEST_CLOCK=1`) the header `X-Factory-Now` fixes it |
 | `conv` | Conversions between database and protobuf types (decimal, date, timestamp) |
 | `metrics` | Request counts and latency histograms in the Prometheus text format (no dependency); messaging metrics (outbox backlog, consumer outcomes, lag, DLQ size) |
@@ -54,7 +54,12 @@ handlers. **No ordering is guaranteed**, not even per subject: handlers must be 
 - `PlatformSQL` (embedded `zz_factory_platform.sql`): `factory_outbox` and `factory_processed_messages`. The factory
   copies it verbatim into a project's `db/schema/`; the runtime never creates tables at start-up.
 - `NewWriter(service).Write(ctx, tx, outbox.Message{Kind, Type, Version, Subject, Data}...)` inserts the messages in
-  the caller's transaction and `NOTIFY`s the relay. Rollback means no message. `occurred_at` is `clock.Now(ctx)`;
+  the caller's transaction. Rollback means no message. After the commit (`txn.AfterCommit`) it wakes the relay with a
+  `NOTIFY` sent outside the transaction and coalesced per pool (v0.5.2): at most one `NOTIFY` in flight per process,
+  commits that happen meanwhile share the next one. Until v0.5.1 the `NOTIFY` ran inside the write transaction; a
+  transaction that notified holds a cluster-wide lock at commit until its WAL flush, so every outbox-writing commit on
+  a Postgres instance was serialized (one fsync each) whatever the number of replicas. Called outside `InTx`, no
+  wake-up is sent and the relay's poll picks the messages up. `occurred_at` is `clock.Now(ctx)`;
   each row counts as a write for test fault injection (`txn.AfterWrite`).
 - `Relay{DB, Broker}.Run(ctx)`: one active relay per database (`leader`, advisory lock); batches of 100 by `seq`;
   persistent publishes with `message_id` = envelope id; waits for publisher confirms and only then sets
@@ -62,7 +67,9 @@ handlers. **No ordering is guaranteed**, not even per subject: handlers must be 
   `last_error` and is retried; an unroutable event (no subscriber queue is bound: the system topology was not applied,
   or nobody subscribes) is marked published but not silently — `last_error = 'unroutable: …'`, an ERROR log and
   `factory_outbox_unroutable_total{kind,type}`. Failed rows back off individually (1s → 30s); a broken broker connection backs off the relay.
-  Woken by `NOTIFY`, polls every second as a fallback. Hourly cleanup (`Cleanup`): published rows after 7 days,
+  Woken by `NOTIFY`, polls every second as a fallback (a lost wake-up only delays a message by up to `Poll`). The
+  bookkeeping after a batch (`published_at`, `attempts`, `last_error`) uses its own context, so a confirm timeout is
+  recorded and retried instead of making the relay step down (v0.5.2). Hourly cleanup (`Cleanup`): published rows after 7 days,
   dedup rows after 14 days. A crash between publish and mark re-publishes the same id with the same bytes.
 
 ### `consume`

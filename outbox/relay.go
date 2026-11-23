@@ -54,7 +54,9 @@ type Relay struct {
 
 	crash   crashPlan
 	batches int
-	skip    map[int64]time.Time // 失败的行: 下次可以再发的时刻(只在内存里;换了工作者就从头退避)
+	// confirmWait: 等一条 publisher confirm(nil = DeferredConfirmation.WaitContext;测试用它模拟 broker 不回 confirm)
+	confirmWait func(ctx context.Context, c *amqp.DeferredConfirmation) (bool, error)
+	skip        map[int64]time.Time // 失败的行: 下次可以再发的时刻(只在内存里;换了工作者就从头退避)
 }
 
 func (r *Relay) defaults() {
@@ -88,7 +90,14 @@ func (r *Relay) defaults() {
 	if r.skip == nil {
 		r.skip = map[int64]time.Time{}
 	}
+	if r.confirmWait == nil {
+		r.confirmWait = func(ctx context.Context, c *amqp.DeferredConfirmation) (bool, error) { return c.WaitContext(ctx) }
+	}
 }
+
+// bookkeepingTimeout: 一批发完之后标记(published_at / attempts / last_error)的上限。用自己的 context:
+// 等 confirm 的 bctx 可能已经超时了(confirm 超时正是要记下来的情况),拿它去 UPDATE 只会失败、让工作者下台。
+const bookkeepingTimeout = 10 * time.Second
 
 // Run: 竞选并工作,直到 ctx 结束(返回 nil)。测试的崩溃点写错了 → 立刻返回错误。
 func (r *Relay) Run(ctx context.Context) error {
@@ -278,11 +287,17 @@ WHERE published_at IS NULL AND seq <> ALL($2::bigint[]) ORDER BY seq LIMIT $1`, 
 	if r.crash.point == CrashAfterPublish && r.batches == r.crash.batch {
 		exit()
 	}
+	// 标记用新的 context(bctx 可能已经过期: 发布 / 等 confirm 超时);同样不被停机打断
+	bookkeeping := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+	}
 	if pubErr != nil { // channel / 连接坏了: 这一批都不算发出(发出去的那几条之后会同 id 再发)
 		for _, x := range batch {
 			failed[x.seq] = pubErr.Error()
 		}
-		if err := r.markFailed(bctx, conn, batch, failed); err != nil {
+		mctx, mcancel := bookkeeping()
+		defer mcancel()
+		if err := r.markFailed(mctx, conn, batch, failed); err != nil {
 			return 0, err
 		}
 		metrics.OutboxPublishError("broker", len(batch))
@@ -293,7 +308,7 @@ WHERE published_at IS NULL AND seq <> ALL($2::bigint[]) ORDER BY seq LIMIT $1`, 
 		if confirms[i] == nil {
 			continue
 		}
-		acked, err := confirms[i].WaitContext(bctx)
+		acked, err := r.confirmWait(bctx, confirms[i])
 		switch {
 		case err != nil:
 			failed[x.seq] = "confirm timeout"
@@ -331,6 +346,8 @@ WHERE published_at IS NULL AND seq <> ALL($2::bigint[]) ORDER BY seq LIMIT $1`, 
 	if r.crash.point == CrashAfterConfirm && r.batches == r.crash.batch {
 		exit()
 	}
+	mctx, mcancel := bookkeeping()
+	defer mcancel()
 	ok := make([]int64, 0, len(batch))
 	for _, x := range batch {
 		if _, bad := failed[x.seq]; !bad {
@@ -338,19 +355,19 @@ WHERE published_at IS NULL AND seq <> ALL($2::bigint[]) ORDER BY seq LIMIT $1`, 
 		}
 	}
 	if len(ok) > 0 {
-		if _, err := conn.Exec(bctx, `UPDATE factory_outbox SET published_at = now() WHERE seq = ANY($1::bigint[])`, ok); err != nil {
+		if _, err := conn.Exec(mctx, `UPDATE factory_outbox SET published_at = now() WHERE seq = ANY($1::bigint[])`, ok); err != nil {
 			return 0, err
 		}
 		metrics.OutboxPublished(len(ok))
 	}
 	for _, x := range batch { // 退回的事件: 发出去了但没人收 —— outbox 里留下记录(运维查 last_error LIKE 'unroutable%')
 		if why, bad := unroutable[x.seq]; bad {
-			if _, err := conn.Exec(bctx, `UPDATE factory_outbox SET last_error = $2 WHERE seq = $1`, x.seq, why); err != nil {
+			if _, err := conn.Exec(mctx, `UPDATE factory_outbox SET last_error = $2 WHERE seq = $1`, x.seq, why); err != nil {
 				return 0, err
 			}
 		}
 	}
-	if err := r.markFailed(bctx, conn, batch, failed); err != nil {
+	if err := r.markFailed(mctx, conn, batch, failed); err != nil {
 		return 0, err
 	}
 	if brokerErr != nil {
